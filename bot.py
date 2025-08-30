@@ -1,6 +1,8 @@
+# -*- coding: utf-8 -*-
 import os
+import threading
 import psycopg2
-from urllib.parse import urlparse
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,201 +15,200 @@ from telegram.ext import (
 )
 
 # --- CONFIGURATION ---
-TOKEN = os.getenv('TELEGRAM_TOKEN')
-ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
-DATABASE_URL = os.getenv('DATABASE_URL')
+TOKEN = os.getenv("TOKEN")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- DATABASE HELPER FUNCTIONS ---
-
+# --- DATABASE FUNCTIONS ---
 def get_db_connection():
-    """Establishes a connection to the database."""
-    result = urlparse(DATABASE_URL)
-    conn = psycopg2.connect(
-        dbname=result.path[1:],
-        user=result.username,
-        password=result.password,
-        host=result.hostname,
-        port=result.port
-    )
+    conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 def setup_database():
-    """Creates the users table if it doesn't exist."""
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('''
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
             payment_method TEXT,
             payment_details TEXT
         );
-    ''')
+    """
+    )
     conn.commit()
     cur.close()
     conn.close()
 
-def save_user_details(user_id, method, details):
-    """Saves or updates user payment details."""
+def save_user_data(user_id, method, details):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO users (user_id, payment_method, payment_details) VALUES (%s, %s, %s) "
-        "ON CONFLICT (user_id) DO UPDATE SET payment_method = EXCLUDED.payment_method, payment_details = EXCLUDED.payment_details;",
-        (user_id, method, details)
+        "ON CONFLICT (user_id) DO UPDATE SET payment_method = %s, payment_details = %s;",
+        (user_id, method, details, method, details),
     )
     conn.commit()
     cur.close()
     conn.close()
 
-def get_user_details(user_id):
-    """Retrieves user payment details."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT payment_method, payment_details FROM users WHERE user_id = %s;", (user_id,))
-    user_data = cur.fetchone()
-    cur.close()
-    conn.close()
-    return user_data
-
-# --- BOT LOGIC ---
-
-# States for ConversationHandler
+# --- BOT STATES FOR CONVERSATION ---
 SELECTING_METHOD, TYPING_DETAILS = range(2)
 
-# Start command and initial setup
+# --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
     keyboard = [
-        [InlineKeyboardButton("💰 Site Balance (Promo Code)", callback_data='site_balance')],
-        [InlineKeyboardButton("💳 Bank Card (Number only)", callback_data='bank_card')],
-        [InlineKeyboardButton("🪙 USDT (TRC-20 Address)", callback_data='usdt')],
+        [InlineKeyboardButton("Setup Payment Details", callback_data="setup_payment")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_html(
-        f"Hello, {user.mention_html()}! Welcome to the promo event.\n\n"
-        "Please set up your payment method to participate. Your data will be kept secure.",
-        reply_markup=reply_markup
-    )
-    return SELECTING_METHOD
-
-# Handles the user's choice of payment method
-async def select_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    context.user_data['payment_method'] = query.data
-
-    prompt_text = ""
-    if query.data == 'site_balance':
-        prompt_text = "You've selected Site Balance. If your submission is approved, we will provide a promo code for the corresponding amount. Please send any text (e.g., 'ok') to confirm."
-    elif query.data == 'bank_card':
-        prompt_text = "You've selected Bank Card. Please send your card number (digits only). Do NOT send expiration date or CVV."
-    elif query.data == 'usdt':
-        prompt_text = "You've selected USDT (TRC-20). Please send your wallet address."
-
-    await query.edit_message_text(text=prompt_text)
-    return TYPING_DETAILS
-
-# Handles the user typing their payment details
-async def receive_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    method = context.user_data.get('payment_method')
-    details = "Promo Code" if method == 'site_balance' else update.message.text
-    
-    # Save details to the database
-    save_user_details(user_id, method, details)
-
     await update.message.reply_text(
-        "Thank you! Your payment details have been saved. You can now send me a link to your video.\n\n"
-        "Please note: the review process can take a significant amount of time. We appreciate your patience."
+        "Welcome! I am your assistant for the promo event.\n\n"
+        "Please set up your payment details before submitting a video. "
+        "You can also send a link to your video directly.",
+        reply_markup=reply_markup,
     )
     return ConversationHandler.END
 
-# Handles video submissions
+async def setup_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    keyboard = [
+        [InlineKeyboardButton("Site Balance (Promo Code)", callback_data="payment_promo")],
+        [InlineKeyboardButton("Russian Card", callback_data="payment_card")],
+        [InlineKeyboardButton("USDT (TRC-20)", callback_data="payment_usdt")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        "Please choose your preferred payment method:", reply_markup=reply_markup
+    )
+    return SELECTING_METHOD
+
+async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    method = query.data.split("_")[1]
+    context.user_data["payment_method"] = method
+    await query.answer()
+
+    if method == "promo":
+        save_user_data(query.from_user.id, "Site Balance", "Promo Code will be provided.")
+        await query.edit_message_text(
+            "Great! Your payment method is set to 'Site Balance'. "
+            "If your submission is approved, we will provide a promo code. "
+            "You can now send the link to your video."
+        )
+        return ConversationHandler.END
+    else:
+        prompt_text = ""
+        if method == "card":
+            prompt_text = "Please enter your Russian card number:"
+        elif method == "usdt":
+            prompt_text = "Please enter your USDT (TRC-20) wallet address:"
+        
+        await query.edit_message_text(prompt_text)
+        return TYPING_DETAILS
+
+async def save_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    details = update.message.text
+    method = context.user_data.get("payment_method")
+    
+    method_map = {
+        "card": "Russian Card",
+        "usdt": "USDT (TRC-20)"
+    }
+    method_full_name = method_map.get(method, "Unknown")
+
+    save_user_data(user_id, method_full_name, details)
+    
+    await update.message.reply_text(
+        "Thank you! Your payment details have been saved. "
+        "You can now send the link to your video."
+    )
+    return ConversationHandler.END
+
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    
-    # Check if user has set up payment details
-    user_details = get_user_details(user.id)
-    if not user_details:
-        await update.message.reply_text(
-            "Please set up your payment details first by using the /start command."
-        )
-        return
-
-    payment_method, payment_details = user_details
     message_text = update.message.text
-    
+
     admin_message_text = (
         f"New submission from user: {user.mention_html()} (ID: `{user.id}`)\n\n"
-        f"Link: {message_text}\n\n"
-        f"Chosen Payment Method: `{payment_method}`\n"
-        f"Payment Details: `{payment_details}`"
+        f"Message: {message_text}"
     )
 
     keyboard = [
         [
-            InlineKeyboardButton("✅ Approve", callback_data=f'approve_{user.id}'),
-            InlineKeyboardButton("❌ Decline", callback_data=f'decline_{user.id}'),
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"decline_{user.id}"),
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=admin_message_text,
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-    
-    await update.message.reply_text(
-        "Thanks! Your submission has been sent for review.\n\n"
-        "Please be aware that due to a high volume of submissions, the review process may be lengthy. Thank you for your patience."
+        chat_id=ADMIN_CHAT_ID, text=admin_message_text, reply_markup=reply_markup, parse_mode="HTML"
     )
 
-# Handles admin button presses
+    await update.message.reply_text(
+        "Thank you! Your submission has been sent for review. "
+        "Please be patient, this may take some time."
+    )
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    
-    action, user_id_str = query.data.split('_')
+
+    action, user_id_str = query.data.split("_")
     user_id = int(user_id_str)
+
+    if action == "approve":
+        response_text = "Congratulations! Your submission has been APPROVED."
+        await query.edit_message_text(text=f"✅ SUBMISSION APPROVED for user {user_id}.")
+    elif action == "decline":
+        response_text = "We are sorry, but your submission has been DECLINED."
+        await query.edit_message_text(text=f"❌ SUBMISSION DECLINED for user {user_id}.")
     
-    response_text = ""
-    if action == 'approve':
-        response_text = "✅ Congratulations! Your submission has been APPROVED."
-        await query.edit_message_text(text=f"{query.message.text}\n\n--- STATUS: APPROVED ---", parse_mode='HTML')
-    else: # decline
-        response_text = "❌ Unfortunately, your submission has been DECLINED."
-        await query.edit_message_text(text=f"{query.message.text}\n\n--- STATUS: DECLINED ---", parse_mode='HTML')
-        
     await context.bot.send_message(chat_id=user_id, text=response_text)
 
-# Main function to run the bot
+# --- FLASK WEB SERVER FOR RENDER HEALTH CHECKS ---
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Bot is alive!"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
+# --- MAIN FUNCTION ---
 def main() -> None:
     if not all([TOKEN, ADMIN_CHAT_ID, DATABASE_URL]):
         print("ERROR: Missing one or more environment variables (TOKEN, ADMIN_CHAT_ID, DATABASE_URL).")
         return
 
-    # Set up the database table on startup
+    print("Setting up database...")
     setup_database()
-    
-    application = Application.builder().token(TOKEN).build()
+    print("Database setup complete.")
 
-    # Conversation handler for setting up payment info
+    application = Application.builder().token(TOKEN).build()
+    
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
+        entry_points=[CallbackQueryHandler(setup_payment_start, pattern='^setup_payment$')],
         states={
-            SELECTING_METHOD: [CallbackQueryHandler(select_method)],
-            TYPING_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_details)],
+            SELECTING_METHOD: [CallbackQueryHandler(select_payment_method, pattern='^payment_')],
+            TYPING_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_payment_details)],
         },
         fallbacks=[CommandHandler('start', start)],
     )
 
+    application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_submission))
-    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CallbackQueryHandler(button_handler, pattern='^(approve|decline)_'))
 
-    print("Bot is running...")
+    # Start Flask server in a separate thread
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
+
+    print("Bot is starting...")
     application.run_polling()
 
 if __name__ == "__main__":
