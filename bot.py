@@ -53,7 +53,7 @@ def get_youtube_video_stats(video_id: str) -> str:
         comments = int(stats.get('commentCount', 0))
         
         return (
-            f"📊 **YouTube Stats**\n"
+            f"📊 <b>YouTube Stats</b>\n"
             f"👀 Views: {views:,}\n"
             f"👍 Likes: {likes:,}\n"
             f"💬 Comments: {comments:,}"
@@ -81,7 +81,7 @@ def get_tiktok_video_stats(url: str) -> str:
         comments = comments_tag.text if comments_tag else 'N/A'
 
         return (
-            f"📊 **TikTok Stats**\n"
+            f"📊 <b>TikTok Stats</b>\n"
             f"👀 Views: {views}\n"
             f"👍 Likes: {likes}\n"
             f"💬 Comments: {comments}"
@@ -98,6 +98,17 @@ def extract_youtube_id(url: str):
     regex = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|embed\/|v\/|shorts\/)?([a-zA-Z0-9_-]{11})"
     match = re.search(regex, url)
     return match.group(1) if match else None
+
+def get_stats_blocking(url: str) -> str:
+    """Блокирующая функция для получения статистики."""
+    if "tiktok.com" in url:
+        return get_tiktok_video_stats(url)
+    else:
+        video_id = extract_youtube_id(url)
+        if video_id:
+            return get_youtube_video_stats(video_id)
+        else:
+            return "Could not parse YouTube link."
 
 # --- DATABASE FUNCTIONS ---
 def get_db_connection():
@@ -206,16 +217,17 @@ async def fetch_and_update_stats(context: ContextTypes.DEFAULT_TYPE):
     message_text = job_context["message_text"]
     admin_message_id = job_context["admin_message_id"]
 
-    # Выполняем "тяжелую" блокирующую задачу
     stats_text = await context.application.run_in_executor(
         None, get_stats_blocking, message_text
     )
 
-    # Формируем новый текст и обновляем сообщение
     new_admin_text = (
-        f"New submission from: {user.mention_html()} (`{user.id}`)\n\n"
-        f"Link: {message_text}\n\n"
-        f"----\n{stats_text}"
+        f"<b>New Submission</b>\n\n"
+        f"<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
+        f"<b>Video Link:</b> {message_text}\n"
+        f"<b>Direct Stats Link:</b> <a href=\"{message_text}\">Click here</a>\n\n"
+        f"--------------------\n"
+        f"{stats_text}"
     )
     keyboard = [[
         InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
@@ -234,7 +246,6 @@ async def fetch_and_update_stats(context: ContextTypes.DEFAULT_TYPE):
     except TelegramError as e:
         print(f"Could not edit admin message: {e}")
 
-
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message_text = update.message.text
     if not ("tiktok.com" in message_text or "youtube.com" in message_text or "youtu.be" in message_text):
@@ -243,44 +254,53 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     user = update.effective_user
     
-    # 1. Отправляем админу мгновенное уведомление
     initial_admin_text = (
-        f"New submission from: {user.mention_html()} (`{user.id}`)\n\n"
-        f"Link: {message_text}\n\n"
-        f"-----\n"
+        f"<b>New Submission</b>\n\n"
+        f"<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
+        f"<b>Video Link:</b> {message_text}\n"
+        f"<b>Direct Stats Link:</b> <a href=\"{message_text}\">Click here</a>\n\n"
+        f"--------------------\n"
         f"⏳ Fetching stats..."
     )
     admin_message = await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID, text=initial_admin_text, parse_mode="HTML"
     )
 
-    # 2. Запускаем фоновую задачу для получения статистики
     context.job_queue.run_once(
         fetch_and_update_stats, 
-        when=1, # Запустить через 1 секунду
+        when=1,
         data={
             "user": user,
             "message_text": message_text,
             "admin_message_id": admin_message.message_id
-        }
+        },
+        name=f"stats_{user.id}_{admin_message.message_id}"
     )
     
-    # 3. Отвечаем пользователю
     await update.message.reply_text("Thank you! Your submission has been sent for review.")
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+
+    original_text = query.message.text_html
     action, user_id_str = query.data.split("_")
     user_id = int(user_id_str)
+
     if action == "approve":
-        response_text = "Congratulations! Your submission has been APPROVED."
-        await query.edit_message_text(text=f"✅ APPROVED for user {user_id}.")
-    else:
-        response_text = "We are sorry, but your submission has been DECLINED."
-        await query.edit_message_text(text=f"❌ DECLINED for user {user_id}.")
-    await context.bot.send_message(chat_id=user_id, text=response_text)
+        response_text_to_user = "Congratulations! Your submission has been APPROVED.\n\nIf you have any questions, please contact us at: personet.com@proton.me"
+        new_text_for_admin = f"{original_text}\n\n------\n<b>✅ STATUS: APPROVED by {query.from_user.mention_html()}</b>"
+        
+        await query.edit_message_text(text=new_text_for_admin, parse_mode="HTML", reply_markup=None)
+        await context.bot.send_message(chat_id=user_id, text=response_text_to_user)
+    
+    elif action == "decline":
+        response_text_to_user = "We are sorry, but your submission has been DECLINED."
+        new_text_for_admin = f"{original_text}\n\n------\n<b>❌ STATUS: DECLINED by {query.from_user.mention_html()}</b>"
+        
+        await query.edit_message_text(text=new_text_for_admin, parse_mode="HTML", reply_markup=None)
+        await context.bot.send_message(chat_id=user_id, text=response_text_to_user)
 
 # --- ADMIN COMMANDS ---
 async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -342,4 +362,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
