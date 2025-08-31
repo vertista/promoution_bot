@@ -3,7 +3,7 @@ import os
 import re
 import threading
 import time
-import asyncio # Добавили библиотеку для асинхронной анимации
+import asyncio
 import psycopg2
 import requests
 from bs4 import BeautifulSoup
@@ -40,6 +40,7 @@ def get_youtube_video_stats(video_id: str) -> str:
     if not YOUTUBE_API_KEY:
         return "YouTube API key is not configured."
     try:
+        # YouTube API обычно надежен, но таймаут все равно полезен
         youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
         request = youtube.videos().list(part="statistics", id=video_id)
         response = request.execute()
@@ -63,11 +64,12 @@ def get_youtube_video_stats(video_id: str) -> str:
         return "Could not fetch YouTube stats."
 
 def get_tiktok_video_stats(url: str) -> str:
-    """Получает статистику видео с TikTok путем скрапинга страницы."""
+    """Получает статистику видео с TikTok с жестким таймаутом."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     try:
+        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Добавляем timeout=10 секунд на запрос
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -86,6 +88,9 @@ def get_tiktok_video_stats(url: str) -> str:
             f"👍 Likes: {likes}\n"
             f"💬 Comments: {comments}"
         )
+    except requests.exceptions.Timeout:
+        print("TikTok Scraping Error: Request timed out.")
+        return "Could not fetch TikTok stats: request timed out."
     except Exception as e:
         print(f"TikTok Scraping Error: {e}")
         return "Could not fetch TikTok stats (might be private or page layout changed)."
@@ -97,10 +102,7 @@ def extract_youtube_id(url: str):
     return match.group(1) if match else None
 
 def get_stats_blocking(url: str) -> str:
-    """
-    Блокирующая функция для получения статистики.
-    Будет выполняться в отдельном потоке, не мешая боту.
-    """
+    """Блокирующая функция для получения статистики."""
     if "tiktok.com" in url:
         return get_tiktok_video_stats(url)
     else:
@@ -220,7 +222,6 @@ async def animate_loading(message: Update.message, stop_event: asyncio.Event):
             i += 1
             await asyncio.sleep(0.2)
         except TelegramError:
-            # Если сообщение не может быть изменено, просто выходим из цикла
             break
 
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -229,23 +230,17 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Sorry, I only accept links from TikTok and YouTube.")
         return
 
-    # 1. Отправляем начальное сообщение и создаем событие для остановки анимации
     stop_event = asyncio.Event()
     loading_msg = await update.message.reply_text("Analyzing link... ⢿")
-
-    # 2. Запускаем анимацию как фоновую задачу
     animation_task = asyncio.create_task(animate_loading(loading_msg, stop_event))
 
-    # 3. Выполняем "тяжелую" задачу в отдельном потоке
     stats_text = await context.application.run_in_executor(
         None, get_stats_blocking, message_text
     )
 
-    # 4. Останавливаем анимацию
     stop_event.set()
     await animation_task
 
-    # 5. Отправляем результат администратору
     user = update.effective_user
     admin_message_text = (
         f"New submission from: {user.mention_html()} (`{user.id}`)\n\n"
@@ -261,9 +256,7 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         chat_id=ADMIN_CHAT_ID, text=admin_message_text, reply_markup=reply_markup, parse_mode="HTML"
     )
     
-    # 6. Редактируем сообщение пользователя на финальный текст
     await loading_msg.edit_text("Thank you! Your submission has been sent for review.")
-
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -275,7 +268,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(text=f"✅ APPROVED for user {user_id}.")
     else:
         response_text = "We are sorry, but your submission has been DECLINED."
-        await query.edit_message_text(text=f"❌ DECLINED for user {user.id}.")
+        await query.edit_message_text(text=f"❌ DECLINED for user {user_id}.")
     await context.bot.send_message(chat_id=user_id, text=response_text)
 
 # --- ADMIN COMMANDS ---
