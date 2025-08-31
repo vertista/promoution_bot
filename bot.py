@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 import os
-import re # Добавили библиотеку для регулярных выражений (проверка USDT)
+import re
 import threading
 import psycopg2
+from psycopg2 import pool # Импортируем пул соединений
 from flask import Flask
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -23,7 +24,10 @@ TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- VALIDATION FUNCTIONS (НОВЫЙ РАЗДЕЛ) ---
+# Глобальная переменная для пула соединений
+db_pool = None
+
+# --- VALIDATION FUNCTIONS ---
 
 def is_valid_video_link(text: str) -> bool:
     """Проверяет, является ли текст ссылкой на TikTok или YouTube Shorts."""
@@ -50,47 +54,54 @@ def is_valid_usdt_address(address: str) -> bool:
     return re.fullmatch(r"T[a-zA-Z0-9]{33}", address) is not None
 
 
-# --- DATABASE FUNCTIONS ---
-def get_db_connection():
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
-
+# --- DATABASE FUNCTIONS (ОБНОВЛЕНО ДЛЯ РАБОТЫ С ПУЛОМ) ---
 def setup_database():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            payment_method TEXT,
-            payment_details TEXT
-        );
-    """
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    """Создает таблицу users, если она не существует, используя пул соединений."""
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    payment_method TEXT,
+                    payment_details TEXT
+                );
+            """
+            )
+            conn.commit()
+    finally:
+        if conn:
+            db_pool.putconn(conn)
 
 def save_user_data(user_id, method, details):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO users (user_id, payment_method, payment_details) VALUES (%s, %s, %s) "
-        "ON CONFLICT (user_id) DO UPDATE SET payment_method = %s, payment_details = %s;",
-        (user_id, method, details, method, details),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    """Сохраняет или обновляет платежные данные пользователя, используя пул соединений."""
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id, payment_method, payment_details) VALUES (%s, %s, %s) "
+                "ON CONFLICT (user_id) DO UPDATE SET payment_method = %s, payment_details = %s;",
+                (user_id, method, details, method, details),
+            )
+            conn.commit()
+    finally:
+        if conn:
+            db_pool.putconn(conn)
 
-def clear_users_table(): # НОВАЯ ФУНКЦИЯ
-    """Полностью очищает таблицу users."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("TRUNCATE TABLE users;")
-    conn.commit()
-    cur.close()
-    conn.close()
+def clear_users_table():
+    """Полностью очищает таблицу users, используя пул соединений."""
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE users;")
+            conn.commit()
+    finally:
+        if conn:
+            db_pool.putconn(conn)
 
 # --- BOT STATES FOR CONVERSATION ---
 SELECTING_METHOD, TYPING_CARD, TYPING_USDT = range(3)
@@ -153,11 +164,10 @@ async def save_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
     else:
         await update.message.reply_text("Invalid card number. Please enter 16 digits and try again.")
-        return TYPING_CARD # Остаемся в том же состоянии, ждем правильного ввода
+        return TYPING_CARD
 
 async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Сохраняет адрес USDT после валидации."""
-    # ИСПРАВЛЕНИЕ: Удаляем лишние пробелы в начале и конце
     usdt_address = update.message.text.strip()
     if is_valid_usdt_address(usdt_address):
         save_user_data(update.effective_user.id, "USDT (TRC-20)", usdt_address)
@@ -165,11 +175,10 @@ async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
     else:
         await update.message.reply_text("Invalid USDT address. It should start with 'T' and be 34 characters long. Please try again.")
-        return TYPING_USDT # Остаемся в том же состоянии
+        return TYPING_USDT
 
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message_text = update.message.text
-    # ВАЛИДАЦИЯ ССЫЛКИ
     if not is_valid_video_link(message_text):
         await update.message.reply_text("Sorry, I only accept links from TikTok and YouTube Shorts.")
         return
@@ -201,10 +210,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(text=f"✅ SUBMISSION APPROVED for user {user_id}.")
     else:
         response_text = "We are sorry, but your submission has been DECLINED."
-        await query.edit_message_text(text=f"❌ SUBMISSION DECLINED for user {user.id}.")
+        await query.edit_message_text(text=f"❌ SUBMISSION DECLINED for user {user_id}.")
     await context.bot.send_message(chat_id=user_id, text=response_text)
 
-# --- ADMIN COMMANDS (НОВЫЙ РАЗДЕЛ) ---
+# --- ADMIN COMMANDS ---
 async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда для очистки базы данных (только для админа)."""
     if str(update.effective_user.id) != ADMIN_CHAT_ID:
@@ -245,9 +254,16 @@ def run_flask():
 
 # --- MAIN FUNCTION ---
 def main() -> None:
+    """Основная функция для запуска бота."""
+    global db_pool # Объявляем, что будем изменять глобальную переменную
+    
     if not all([TOKEN, ADMIN_CHAT_ID, DATABASE_URL]):
         print("ERROR: Missing one or more environment variables.")
         return
+    
+    print("Creating database connection pool...")
+    # Создаем пул соединений при запуске бота
+    db_pool = pool.SimpleConnectionPool(1, 5, dsn=DATABASE_URL)
     
     print("Setting up database...")
     setup_database()
@@ -266,11 +282,11 @@ def main() -> None:
     )
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("clear_db", clear_db_command)) # Добавили новую команду
+    application.add_handler(CommandHandler("clear_db", clear_db_command))
     application.add_handler(conv_handler)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_submission))
     application.add_handler(CallbackQueryHandler(button_handler, pattern='^(approve|decline)_'))
-    application.add_handler(CallbackQueryHandler(clear_db_confirm, pattern='^clear_db_')) # Добавили обработчик кнопок очистки
+    application.add_handler(CallbackQueryHandler(clear_db_confirm, pattern='^clear_db_'))
 
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
@@ -279,4 +295,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
