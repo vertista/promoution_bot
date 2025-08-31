@@ -145,7 +145,8 @@ async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def save_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Сохраняет номер карты после валидации."""
-    card_number = update.message.text
+    # ИСПРАВЛЕНИЕ: Удаляем пробелы и дефисы из введенного номера
+    card_number = re.sub(r'[\s-]', '', update.message.text)
     if is_valid_russian_card(card_number):
         save_user_data(update.effective_user.id, "Russian Card", card_number)
         await update.message.reply_text("Thank you! Your card number has been saved. You can now send your video link.")
@@ -156,7 +157,8 @@ async def save_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Сохраняет адрес USDT после валидации."""
-    usdt_address = update.message.text
+    # ИСПРАВЛЕНИЕ: Удаляем лишние пробелы в начале и конце
+    usdt_address = update.message.text.strip()
     if is_valid_usdt_address(usdt_address):
         save_user_data(update.effective_user.id, "USDT (TRC-20)", usdt_address)
         await update.message.reply_text("Thank you! Your wallet address has been saved. You can now send your video link.")
@@ -199,7 +201,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(text=f"✅ SUBMISSION APPROVED for user {user_id}.")
     else:
         response_text = "We are sorry, but your submission has been DECLINED."
-        await query.edit_message_text(text=f"❌ SUBMISSION DECLINED for user {user_id}.")
+        await query.edit_message_text(text=f"❌ SUBMISSION DECLINED for user {user.id}.")
     await context.bot.send_message(chat_id=user_id, text=response_text)
 
 # --- ADMIN COMMANDS (НОВЫЙ РАЗДЕЛ) ---
