@@ -3,6 +3,7 @@ import os
 import threading
 import psycopg2
 from flask import Flask
+from dotenv import load_dotenv # Добавили импорт для чтения .env файла
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -15,16 +16,21 @@ from telegram.ext import (
 )
 
 # --- CONFIGURATION ---
+# Загружаем переменные из .env файла, если он существует (для локального запуска)
+load_dotenv() 
+
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # --- DATABASE FUNCTIONS ---
 def get_db_connection():
+    """Устанавливает соединение с базой данных."""
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 def setup_database():
+    """Создает таблицу users, если она не существует."""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
@@ -41,6 +47,7 @@ def setup_database():
     conn.close()
 
 def save_user_data(user_id, method, details):
+    """Сохраняет или обновляет платежные данные пользователя."""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
@@ -57,6 +64,7 @@ SELECTING_METHOD, TYPING_DETAILS = range(2)
 
 # --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик команды /start."""
     keyboard = [
         [InlineKeyboardButton("Setup Payment Details", callback_data="setup_payment")],
     ]
@@ -70,6 +78,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 async def setup_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Начинает диалог настройки платежных данных."""
     query = update.callback_query
     await query.answer()
     keyboard = [
@@ -84,6 +93,7 @@ async def setup_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     return SELECTING_METHOD
 
 async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает выбор способа оплаты."""
     query = update.callback_query
     method = query.data.split("_")[1]
     context.user_data["payment_method"] = method
@@ -108,6 +118,7 @@ async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
         return TYPING_DETAILS
 
 async def save_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Сохраняет введенные пользователем реквизиты."""
     user_id = update.effective_user.id
     details = update.message.text
     method = context.user_data.get("payment_method")
@@ -127,6 +138,7 @@ async def save_payment_details(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает входящие заявки и пересылает администратору."""
     user = update.effective_user
     message_text = update.message.text
 
@@ -153,6 +165,7 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатия кнопок 'Одобрить'/'Отклонить'."""
     query = update.callback_query
     await query.answer()
 
@@ -173,13 +186,16 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
+    """Отвечает на проверки от Render, чтобы бот не "засыпал"."""
     return "Bot is alive!"
 
 def run_flask():
+    """Запускает веб-сервер."""
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 # --- MAIN FUNCTION ---
 def main() -> None:
+    """Основная функция для запуска бота."""
     if not all([TOKEN, ADMIN_CHAT_ID, DATABASE_URL]):
         print("ERROR: Missing one or more environment variables (TOKEN, ADMIN_CHAT_ID, DATABASE_URL).")
         return
@@ -204,7 +220,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_submission))
     application.add_handler(CallbackQueryHandler(button_handler, pattern='^(approve|decline)_'))
 
-    # Start Flask server in a separate thread
+    # Запускаем Flask в отдельном потоке, чтобы не блокировать бота
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
 
@@ -213,4 +229,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
