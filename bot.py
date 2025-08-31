@@ -40,7 +40,6 @@ def get_youtube_video_stats(video_id: str) -> str:
     if not YOUTUBE_API_KEY:
         return "YouTube API key is not configured."
     try:
-        # YouTube API обычно надежен, но таймаут все равно полезен
         youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
         request = youtube.videos().list(part="statistics", id=video_id)
         response = request.execute()
@@ -69,7 +68,6 @@ def get_tiktok_video_stats(url: str) -> str:
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     try:
-        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Добавляем timeout=10 секунд на запрос
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -100,17 +98,6 @@ def extract_youtube_id(url: str):
     regex = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|embed\/|v\/|shorts\/)?([a-zA-Z0-9_-]{11})"
     match = re.search(regex, url)
     return match.group(1) if match else None
-
-def get_stats_blocking(url: str) -> str:
-    """Блокирующая функция для получения статистики."""
-    if "tiktok.com" in url:
-        return get_tiktok_video_stats(url)
-    else:
-        video_id = extract_youtube_id(url)
-        if video_id:
-            return get_youtube_video_stats(video_id)
-        else:
-            return "Could not parse YouTube link."
 
 # --- DATABASE FUNCTIONS ---
 def get_db_connection():
@@ -212,37 +199,20 @@ async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Invalid USDT address format. Please try again.")
         return TYPING_USDT
 
-async def animate_loading(message: Update.message, stop_event: asyncio.Event):
-    """Анимирует сообщение о загрузке."""
-    animation_frames = ["⢿", "⣻", "⣽", "⣾", "⣷", "⣯", "⣟", "⡿"]
-    i = 0
-    while not stop_event.is_set():
-        try:
-            await message.edit_text(f"Analyzing link... {animation_frames[i % len(animation_frames)]}")
-            i += 1
-            await asyncio.sleep(0.2)
-        except TelegramError:
-            break
+async def fetch_and_update_stats(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача для получения статистики и обновления сообщения админа."""
+    job_context = context.job.data
+    user = job_context["user"]
+    message_text = job_context["message_text"]
+    admin_message_id = job_context["admin_message_id"]
 
-async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message_text = update.message.text
-    if not ("tiktok.com" in message_text or "youtube.com" in message_text or "youtu.be" in message_text):
-        await update.message.reply_text("Sorry, I only accept links from TikTok and YouTube.")
-        return
-
-    stop_event = asyncio.Event()
-    loading_msg = await update.message.reply_text("Analyzing link... ⢿")
-    animation_task = asyncio.create_task(animate_loading(loading_msg, stop_event))
-
+    # Выполняем "тяжелую" блокирующую задачу
     stats_text = await context.application.run_in_executor(
         None, get_stats_blocking, message_text
     )
 
-    stop_event.set()
-    await animation_task
-
-    user = update.effective_user
-    admin_message_text = (
+    # Формируем новый текст и обновляем сообщение
+    new_admin_text = (
         f"New submission from: {user.mention_html()} (`{user.id}`)\n\n"
         f"Link: {message_text}\n\n"
         f"----\n{stats_text}"
@@ -252,11 +222,52 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         InlineKeyboardButton("❌ Decline", callback_data=f"decline_{user.id}"),
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID, text=admin_message_text, reply_markup=reply_markup, parse_mode="HTML"
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=ADMIN_CHAT_ID,
+            message_id=admin_message_id,
+            text=new_admin_text,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+    except TelegramError as e:
+        print(f"Could not edit admin message: {e}")
+
+
+async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message_text = update.message.text
+    if not ("tiktok.com" in message_text or "youtube.com" in message_text or "youtu.be" in message_text):
+        await update.message.reply_text("Sorry, I only accept links from TikTok and YouTube.")
+        return
+
+    user = update.effective_user
+    
+    # 1. Отправляем админу мгновенное уведомление
+    initial_admin_text = (
+        f"New submission from: {user.mention_html()} (`{user.id}`)\n\n"
+        f"Link: {message_text}\n\n"
+        f"-----\n"
+        f"⏳ Fetching stats..."
+    )
+    admin_message = await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID, text=initial_admin_text, parse_mode="HTML"
+    )
+
+    # 2. Запускаем фоновую задачу для получения статистики
+    context.job_queue.run_once(
+        fetch_and_update_stats, 
+        when=1, # Запустить через 1 секунду
+        data={
+            "user": user,
+            "message_text": message_text,
+            "admin_message_id": admin_message.message_id
+        }
     )
     
-    await loading_msg.edit_text("Thank you! Your submission has been sent for review.")
+    # 3. Отвечаем пользователю
+    await update.message.reply_text("Thank you! Your submission has been sent for review.")
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -331,3 +342,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
