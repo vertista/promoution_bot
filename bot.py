@@ -3,7 +3,7 @@ import os
 import re
 import threading
 import psycopg2
-from psycopg2 import pool # Импортируем пул соединений
+# Убрали импорт пула соединений
 from flask import Flask
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -23,9 +23,6 @@ load_dotenv()
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Глобальная переменная для пула соединений
-db_pool = None
 
 # --- VALIDATION FUNCTIONS ---
 
@@ -54,54 +51,47 @@ def is_valid_usdt_address(address: str) -> bool:
     return re.fullmatch(r"T[a-zA-Z0-9]{33}", address) is not None
 
 
-# --- DATABASE FUNCTIONS (ОБНОВЛЕНО ДЛЯ РАБОТЫ С ПУЛОМ) ---
+# --- DATABASE FUNCTIONS (ВОЗВРАЩЕНА СТАБИЛЬНАЯ ВЕРСИЯ) ---
+def get_db_connection():
+    """Устанавливает новое соединение с базой данных."""
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
+
 def setup_database():
-    """Создает таблицу users, если она не существует, используя пул соединений."""
-    conn = None
-    try:
-        conn = db_pool.getconn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    payment_method TEXT,
-                    payment_details TEXT
-                );
+    """Создает таблицу users, если она не существует."""
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute(
             """
-            )
-            conn.commit()
-    finally:
-        if conn:
-            db_pool.putconn(conn)
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                payment_method TEXT,
+                payment_details TEXT
+            );
+        """
+        )
+        conn.commit()
+    conn.close()
 
 def save_user_data(user_id, method, details):
-    """Сохраняет или обновляет платежные данные пользователя, используя пул соединений."""
-    conn = None
-    try:
-        conn = db_pool.getconn()
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO users (user_id, payment_method, payment_details) VALUES (%s, %s, %s) "
-                "ON CONFLICT (user_id) DO UPDATE SET payment_method = %s, payment_details = %s;",
-                (user_id, method, details, method, details),
-            )
-            conn.commit()
-    finally:
-        if conn:
-            db_pool.putconn(conn)
+    """Сохраняет или обновляет платежные данные пользователя."""
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO users (user_id, payment_method, payment_details) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET payment_method = %s, payment_details = %s;",
+            (user_id, method, details, method, details),
+        )
+        conn.commit()
+    conn.close()
 
 def clear_users_table():
-    """Полностью очищает таблицу users, используя пул соединений."""
-    conn = None
-    try:
-        conn = db_pool.getconn()
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE users;")
-            conn.commit()
-    finally:
-        if conn:
-            db_pool.putconn(conn)
+    """Полностью очищает таблицу users."""
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE TABLE users;")
+        conn.commit()
+    conn.close()
 
 # --- BOT STATES FOR CONVERSATION ---
 SELECTING_METHOD, TYPING_CARD, TYPING_USDT = range(3)
@@ -156,7 +146,6 @@ async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def save_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Сохраняет номер карты после валидации."""
-    # ИСПРАВЛЕНИЕ: Удаляем пробелы и дефисы из введенного номера
     card_number = re.sub(r'[\s-]', '', update.message.text)
     if is_valid_russian_card(card_number):
         save_user_data(update.effective_user.id, "Russian Card", card_number)
@@ -215,7 +204,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # --- ADMIN COMMANDS ---
 async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда для очистки базы данных (только для админа)."""
     if str(update.effective_user.id) != ADMIN_CHAT_ID:
         await update.message.reply_text("You are not authorized to use this command.")
         return
@@ -233,7 +221,6 @@ async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 async def clear_db_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик подтверждения очистки базы."""
     query = update.callback_query
     await query.answer()
     action = query.data.split("_")[-1]
@@ -254,16 +241,9 @@ def run_flask():
 
 # --- MAIN FUNCTION ---
 def main() -> None:
-    """Основная функция для запуска бота."""
-    global db_pool # Объявляем, что будем изменять глобальную переменную
-    
     if not all([TOKEN, ADMIN_CHAT_ID, DATABASE_URL]):
         print("ERROR: Missing one or more environment variables.")
         return
-    
-    print("Creating database connection pool...")
-    # Создаем пул соединений при запуске бота
-    db_pool = pool.SimpleConnectionPool(1, 5, dsn=DATABASE_URL)
     
     print("Setting up database...")
     setup_database()
