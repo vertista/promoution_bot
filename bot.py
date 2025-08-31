@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 import os
+import re # Добавили библиотеку для регулярных выражений (проверка USDT)
 import threading
 import psycopg2
 from flask import Flask
-from dotenv import load_dotenv # Добавили импорт для чтения .env файла
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -16,21 +17,45 @@ from telegram.ext import (
 )
 
 # --- CONFIGURATION ---
-# Загружаем переменные из .env файла, если он существует (для локального запуска)
-load_dotenv() 
+load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# --- VALIDATION FUNCTIONS (НОВЫЙ РАЗДЕЛ) ---
+
+def is_valid_video_link(text: str) -> bool:
+    """Проверяет, является ли текст ссылкой на TikTok или YouTube Shorts."""
+    return "tiktok.com" in text or "youtube.com/shorts/" in text
+
+def is_valid_russian_card(card_number: str) -> bool:
+    """Проверяет номер карты РФ (16 цифр) с помощью алгоритма Луна."""
+    if not re.fullmatch(r"\d{16}", card_number):
+        return False
+    digits = [int(d) for d in card_number]
+    checksum = 0
+    for i, digit in enumerate(digits):
+        if i % 2 == 0:
+            doubled_digit = digit * 2
+            if doubled_digit > 9:
+                doubled_digit -= 9
+            checksum += doubled_digit
+        else:
+            checksum += digit
+    return checksum % 10 == 0
+
+def is_valid_usdt_address(address: str) -> bool:
+    """Проверяет базовый формат адреса USDT TRC-20."""
+    return re.fullmatch(r"T[a-zA-Z0-9]{33}", address) is not None
+
+
 # --- DATABASE FUNCTIONS ---
 def get_db_connection():
-    """Устанавливает соединение с базой данных."""
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 def setup_database():
-    """Создает таблицу users, если она не существует."""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
@@ -47,7 +72,6 @@ def setup_database():
     conn.close()
 
 def save_user_data(user_id, method, details):
-    """Сохраняет или обновляет платежные данные пользователя."""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
@@ -59,12 +83,20 @@ def save_user_data(user_id, method, details):
     cur.close()
     conn.close()
 
+def clear_users_table(): # НОВАЯ ФУНКЦИЯ
+    """Полностью очищает таблицу users."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("TRUNCATE TABLE users;")
+    conn.commit()
+    cur.close()
+    conn.close()
+
 # --- BOT STATES FOR CONVERSATION ---
-SELECTING_METHOD, TYPING_DETAILS = range(2)
+SELECTING_METHOD, TYPING_CARD, TYPING_USDT = range(3)
 
 # --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик команды /start."""
     keyboard = [
         [InlineKeyboardButton("Setup Payment Details", callback_data="setup_payment")],
     ]
@@ -78,7 +110,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 async def setup_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Начинает диалог настройки платежных данных."""
     query = update.callback_query
     await query.answer()
     keyboard = [
@@ -93,60 +124,59 @@ async def setup_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     return SELECTING_METHOD
 
 async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обрабатывает выбор способа оплаты."""
     query = update.callback_query
     method = query.data.split("_")[1]
-    context.user_data["payment_method"] = method
     await query.answer()
 
     if method == "promo":
         save_user_data(query.from_user.id, "Site Balance", "Promo Code will be provided.")
         await query.edit_message_text(
             "Great! Your payment method is set to 'Site Balance'. "
-            "If your submission is approved, we will provide a promo code. "
             "You can now send the link to your video."
         )
         return ConversationHandler.END
     else:
-        prompt_text = ""
         if method == "card":
-            prompt_text = "Please enter your Russian card number:"
+            await query.edit_message_text("Please enter your Russian card number (16 digits):")
+            return TYPING_CARD
         elif method == "usdt":
-            prompt_text = "Please enter your USDT (TRC-20) wallet address:"
-        
-        await query.edit_message_text(prompt_text)
-        return TYPING_DETAILS
+            await query.edit_message_text("Please enter your USDT (TRC-20) wallet address:")
+            return TYPING_USDT
 
-async def save_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сохраняет введенные пользователем реквизиты."""
-    user_id = update.effective_user.id
-    details = update.message.text
-    method = context.user_data.get("payment_method")
-    
-    method_map = {
-        "card": "Russian Card",
-        "usdt": "USDT (TRC-20)"
-    }
-    method_full_name = method_map.get(method, "Unknown")
+async def save_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Сохраняет номер карты после валидации."""
+    card_number = update.message.text
+    if is_valid_russian_card(card_number):
+        save_user_data(update.effective_user.id, "Russian Card", card_number)
+        await update.message.reply_text("Thank you! Your card number has been saved. You can now send your video link.")
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("Invalid card number. Please enter 16 digits and try again.")
+        return TYPING_CARD # Остаемся в том же состоянии, ждем правильного ввода
 
-    save_user_data(user_id, method_full_name, details)
-    
-    await update.message.reply_text(
-        "Thank you! Your payment details have been saved. "
-        "You can now send the link to your video."
-    )
-    return ConversationHandler.END
+async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Сохраняет адрес USDT после валидации."""
+    usdt_address = update.message.text
+    if is_valid_usdt_address(usdt_address):
+        save_user_data(update.effective_user.id, "USDT (TRC-20)", usdt_address)
+        await update.message.reply_text("Thank you! Your wallet address has been saved. You can now send your video link.")
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("Invalid USDT address. It should start with 'T' and be 34 characters long. Please try again.")
+        return TYPING_USDT # Остаемся в том же состоянии
 
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает входящие заявки и пересылает администратору."""
-    user = update.effective_user
     message_text = update.message.text
-
+    # ВАЛИДАЦИЯ ССЫЛКИ
+    if not is_valid_video_link(message_text):
+        await update.message.reply_text("Sorry, I only accept links from TikTok and YouTube Shorts.")
+        return
+    
+    user = update.effective_user
     admin_message_text = (
         f"New submission from user: {user.mention_html()} (ID: `{user.id}`)\n\n"
-        f"Message: {message_text}"
+        f"Link: {message_text}"
     )
-
     keyboard = [
         [
             InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
@@ -154,52 +184,69 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID, text=admin_message_text, reply_markup=reply_markup, parse_mode="HTML"
     )
-
-    await update.message.reply_text(
-        "Thank you! Your submission has been sent for review. "
-        "Please be patient, this may take some time."
-    )
+    await update.message.reply_text("Thank you! Your submission has been sent for review.")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает нажатия кнопок 'Одобрить'/'Отклонить'."""
     query = update.callback_query
     await query.answer()
-
     action, user_id_str = query.data.split("_")
     user_id = int(user_id_str)
-
     if action == "approve":
         response_text = "Congratulations! Your submission has been APPROVED."
         await query.edit_message_text(text=f"✅ SUBMISSION APPROVED for user {user_id}.")
-    elif action == "decline":
+    else:
         response_text = "We are sorry, but your submission has been DECLINED."
         await query.edit_message_text(text=f"❌ SUBMISSION DECLINED for user {user_id}.")
-    
     await context.bot.send_message(chat_id=user_id, text=response_text)
 
-# --- FLASK WEB SERVER FOR RENDER HEALTH CHECKS ---
-app = Flask(__name__)
+# --- ADMIN COMMANDS (НОВЫЙ РАЗДЕЛ) ---
+async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для очистки базы данных (только для админа)."""
+    if str(update.effective_user.id) != ADMIN_CHAT_ID:
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
 
+    keyboard = [
+        [
+            InlineKeyboardButton("YES, I am sure", callback_data="clear_db_confirm"),
+            InlineKeyboardButton("NO, cancel", callback_data="clear_db_cancel"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "⚠️ WARNING! Are you sure you want to delete ALL user data from the database? This action cannot be undone.",
+        reply_markup=reply_markup
+    )
+
+async def clear_db_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик подтверждения очистки базы."""
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split("_")[-1]
+
+    if action == "confirm":
+        clear_users_table()
+        await query.edit_message_text("✅ Database has been cleared successfully.")
+    else:
+        await query.edit_message_text("Database clearing operation cancelled.")
+
+# --- FLASK WEB SERVER ---
+app = Flask(__name__)
 @app.route("/")
 def index():
-    """Отвечает на проверки от Render, чтобы бот не "засыпал"."""
     return "Bot is alive!"
-
 def run_flask():
-    """Запускает веб-сервер."""
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 # --- MAIN FUNCTION ---
 def main() -> None:
-    """Основная функция для запуска бота."""
     if not all([TOKEN, ADMIN_CHAT_ID, DATABASE_URL]):
-        print("ERROR: Missing one or more environment variables (TOKEN, ADMIN_CHAT_ID, DATABASE_URL).")
+        print("ERROR: Missing one or more environment variables.")
         return
-
+    
     print("Setting up database...")
     setup_database()
     print("Database setup complete.")
@@ -210,22 +257,24 @@ def main() -> None:
         entry_points=[CallbackQueryHandler(setup_payment_start, pattern='^setup_payment$')],
         states={
             SELECTING_METHOD: [CallbackQueryHandler(select_payment_method, pattern='^payment_')],
-            TYPING_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_payment_details)],
+            TYPING_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_card_details)],
+            TYPING_USDT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_usdt_details)],
         },
         fallbacks=[CommandHandler('start', start)],
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("clear_db", clear_db_command)) # Добавили новую команду
     application.add_handler(conv_handler)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_submission))
     application.add_handler(CallbackQueryHandler(button_handler, pattern='^(approve|decline)_'))
+    application.add_handler(CallbackQueryHandler(clear_db_confirm, pattern='^clear_db_')) # Добавили обработчик кнопок очистки
 
-    # Запускаем Flask в отдельном потоке, чтобы не блокировать бота
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
-
     print("Bot is starting...")
     application.run_polling()
 
 if __name__ == "__main__":
     main()
+
