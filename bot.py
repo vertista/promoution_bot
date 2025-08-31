@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import time
+import asyncio # Добавили библиотеку для асинхронной анимации
 import psycopg2
 import requests
 from bs4 import BeautifulSoup
@@ -10,6 +11,7 @@ from flask import Flask
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -66,7 +68,7 @@ def get_tiktok_video_stats(url: str) -> str:
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
@@ -93,6 +95,20 @@ def extract_youtube_id(url: str):
     regex = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|embed\/|v\/|shorts\/)?([a-zA-Z0-9_-]{11})"
     match = re.search(regex, url)
     return match.group(1) if match else None
+
+def get_stats_blocking(url: str) -> str:
+    """
+    Блокирующая функция для получения статистики.
+    Будет выполняться в отдельном потоке, не мешая боту.
+    """
+    if "tiktok.com" in url:
+        return get_tiktok_video_stats(url)
+    else:
+        video_id = extract_youtube_id(url)
+        if video_id:
+            return get_youtube_video_stats(video_id)
+        else:
+            return "Could not parse YouTube link."
 
 # --- DATABASE FUNCTIONS ---
 def get_db_connection():
@@ -194,22 +210,42 @@ async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Invalid USDT address format. Please try again.")
         return TYPING_USDT
 
+async def animate_loading(message: Update.message, stop_event: asyncio.Event):
+    """Анимирует сообщение о загрузке."""
+    animation_frames = ["⢿", "⣻", "⣽", "⣾", "⣷", "⣯", "⣟", "⡿"]
+    i = 0
+    while not stop_event.is_set():
+        try:
+            await message.edit_text(f"Analyzing link... {animation_frames[i % len(animation_frames)]}")
+            i += 1
+            await asyncio.sleep(0.2)
+        except TelegramError:
+            # Если сообщение не может быть изменено, просто выходим из цикла
+            break
+
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message_text = update.message.text
     if not ("tiktok.com" in message_text or "youtube.com" in message_text or "youtu.be" in message_text):
         await update.message.reply_text("Sorry, I only accept links from TikTok and YouTube.")
         return
 
-    stats_text = ""
-    if "tiktok.com" in message_text:
-        stats_text = get_tiktok_video_stats(message_text)
-    else:
-        video_id = extract_youtube_id(message_text)
-        if video_id:
-            stats_text = get_youtube_video_stats(video_id)
-        else:
-            stats_text = "Could not parse YouTube link."
+    # 1. Отправляем начальное сообщение и создаем событие для остановки анимации
+    stop_event = asyncio.Event()
+    loading_msg = await update.message.reply_text("Analyzing link... ⢿")
 
+    # 2. Запускаем анимацию как фоновую задачу
+    animation_task = asyncio.create_task(animate_loading(loading_msg, stop_event))
+
+    # 3. Выполняем "тяжелую" задачу в отдельном потоке
+    stats_text = await context.application.run_in_executor(
+        None, get_stats_blocking, message_text
+    )
+
+    # 4. Останавливаем анимацию
+    stop_event.set()
+    await animation_task
+
+    # 5. Отправляем результат администратору
     user = update.effective_user
     admin_message_text = (
         f"New submission from: {user.mention_html()} (`{user.id}`)\n\n"
@@ -224,7 +260,10 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID, text=admin_message_text, reply_markup=reply_markup, parse_mode="HTML"
     )
-    await update.message.reply_text("Thank you! Your submission has been sent for review.")
+    
+    # 6. Редактируем сообщение пользователя на финальный текст
+    await loading_msg.edit_text("Thank you! Your submission has been sent for review.")
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
