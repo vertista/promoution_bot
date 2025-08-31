@@ -2,8 +2,8 @@
 import os
 import re
 import threading
+import time
 import psycopg2
-# Убрали импорт пула соединений
 from flask import Flask
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,57 +24,55 @@ TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# --- ГЛОБАЛЬНЫЙ ФЛАГ ГОТОВНОСТИ БАЗЫ ДАННЫХ ---
+DB_READY = False
+
 # --- VALIDATION FUNCTIONS ---
 
 def is_valid_video_link(text: str) -> bool:
-    """Проверяет, является ли текст ссылкой на TikTok или YouTube Shorts."""
     return "tiktok.com" in text or "youtube.com/shorts/" in text
 
-def is_valid_russian_card(card_number: str) -> bool:
-    """Проверяет номер карты РФ (16 цифр) с помощью алгоритма Луна."""
-    if not re.fullmatch(r"\d{16}", card_number):
-        return False
-    digits = [int(d) for d in card_number]
-    checksum = 0
-    for i, digit in enumerate(digits):
-        if i % 2 == 0:
-            doubled_digit = digit * 2
-            if doubled_digit > 9:
-                doubled_digit -= 9
-            checksum += doubled_digit
-        else:
-            checksum += digit
-    return checksum % 10 == 0
+def is_valid_card_number(card_number: str) -> bool:
+    return re.fullmatch(r"\d{16}", card_number) is not None
 
 def is_valid_usdt_address(address: str) -> bool:
-    """Проверяет базовый формат адреса USDT TRC-20."""
     return re.fullmatch(r"T[a-zA-Z0-9]{33}", address) is not None
 
-
-# --- DATABASE FUNCTIONS (ВОЗВРАЩЕНА СТАБИЛЬНАЯ ВЕРСИЯ) ---
+# --- DATABASE FUNCTIONS ---
 def get_db_connection():
-    """Устанавливает новое соединение с базой данных."""
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
-def setup_database():
-    """Создает таблицу users, если она не существует."""
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                payment_method TEXT,
-                payment_details TEXT
-            );
-        """
-        )
-        conn.commit()
-    conn.close()
+def setup_database_in_background():
+    """
+    "Тяжелая" функция, которая выполняется в отдельном потоке,
+    не мешая боту быстро запуститься.
+    """
+    global DB_READY
+    print("Starting background database setup...")
+    while not DB_READY:
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,
+                        payment_method TEXT,
+                        payment_details TEXT
+                    );
+                """
+                )
+                conn.commit()
+            conn.close()
+            DB_READY = True
+            print("✅ Background database setup complete.")
+        except Exception as e:
+            print(f"Error setting up database: {e}. Retrying in 5 seconds...")
+            time.sleep(5)
+
 
 def save_user_data(user_id, method, details):
-    """Сохраняет или обновляет платежные данные пользователя."""
     conn = get_db_connection()
     with conn.cursor() as cur:
         cur.execute(
@@ -86,7 +84,6 @@ def save_user_data(user_id, method, details):
     conn.close()
 
 def clear_users_table():
-    """Полностью очищает таблицу users."""
     conn = get_db_connection()
     with conn.cursor() as cur:
         cur.execute("TRUNCATE TABLE users;")
@@ -98,21 +95,26 @@ SELECTING_METHOD, TYPING_CARD, TYPING_USDT = range(3)
 
 # --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Простая и быстрая команда /start."""
     keyboard = [
         [InlineKeyboardButton("Setup Payment Details", callback_data="setup_payment")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "Welcome! I am your assistant for the promo event.\n\n"
-        "Please set up your payment details before submitting a video. "
-        "You can also send a link to your video directly.",
+        "Welcome! Please set up your payment details or send your video link.",
         reply_markup=reply_markup,
     )
     return ConversationHandler.END
 
 async def setup_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Проверяет, готова ли база, прежде чем показать кнопки."""
     query = update.callback_query
     await query.answer()
+
+    if not DB_READY:
+        await query.edit_message_text("The database is warming up. Please try again in a few seconds.")
+        return ConversationHandler.END
+
     keyboard = [
         [InlineKeyboardButton("Site Balance (Promo Code)", callback_data="payment_promo")],
         [InlineKeyboardButton("Russian Card", callback_data="payment_card")],
@@ -132,8 +134,7 @@ async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
     if method == "promo":
         save_user_data(query.from_user.id, "Site Balance", "Promo Code will be provided.")
         await query.edit_message_text(
-            "Great! Your payment method is set to 'Site Balance'. "
-            "You can now send the link to your video."
+            "Great! Payment method set to 'Site Balance'. You can now send your video link."
         )
         return ConversationHandler.END
     else:
@@ -145,25 +146,23 @@ async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
             return TYPING_USDT
 
 async def save_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сохраняет номер карты после валидации."""
     card_number = re.sub(r'[\s-]', '', update.message.text)
-    if is_valid_russian_card(card_number):
+    if is_valid_card_number(card_number):
         save_user_data(update.effective_user.id, "Russian Card", card_number)
-        await update.message.reply_text("Thank you! Your card number has been saved. You can now send your video link.")
+        await update.message.reply_text("Thank you! Your card number is saved. You can now send your video link.")
         return ConversationHandler.END
     else:
-        await update.message.reply_text("Invalid card number. Please enter 16 digits and try again.")
+        await update.message.reply_text("Invalid format. Please enter 16 digits and try again.")
         return TYPING_CARD
 
 async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сохраняет адрес USDT после валидации."""
     usdt_address = update.message.text.strip()
     if is_valid_usdt_address(usdt_address):
         save_user_data(update.effective_user.id, "USDT (TRC-20)", usdt_address)
-        await update.message.reply_text("Thank you! Your wallet address has been saved. You can now send your video link.")
+        await update.message.reply_text("Thank you! Your wallet address is saved. You can now send your video link.")
         return ConversationHandler.END
     else:
-        await update.message.reply_text("Invalid USDT address. It should start with 'T' and be 34 characters long. Please try again.")
+        await update.message.reply_text("Invalid USDT address format. Please try again.")
         return TYPING_USDT
 
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -173,16 +172,11 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     
     user = update.effective_user
-    admin_message_text = (
-        f"New submission from user: {user.mention_html()} (ID: `{user.id}`)\n\n"
-        f"Link: {message_text}"
-    )
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
-            InlineKeyboardButton("❌ Decline", callback_data=f"decline_{user.id}"),
-        ]
-    ]
+    admin_message_text = (f"New submission from: {user.mention_html()} (`{user.id}`)\n\n{message_text}")
+    keyboard = [[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
+        InlineKeyboardButton("❌ Decline", callback_data=f"decline_{user.id}"),
+    ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID, text=admin_message_text, reply_markup=reply_markup, parse_mode="HTML"
@@ -196,58 +190,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = int(user_id_str)
     if action == "approve":
         response_text = "Congratulations! Your submission has been APPROVED."
-        await query.edit_message_text(text=f"✅ SUBMISSION APPROVED for user {user_id}.")
+        await query.edit_message_text(text=f"✅ APPROVED for user {user_id}.")
     else:
         response_text = "We are sorry, but your submission has been DECLINED."
-        await query.edit_message_text(text=f"❌ SUBMISSION DECLINED for user {user_id}.")
+        await query.edit_message_text(text=f"❌ DECLINED for user {user.id}.")
     await context.bot.send_message(chat_id=user_id, text=response_text)
 
 # --- ADMIN COMMANDS ---
 async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if str(update.effective_user.id) != ADMIN_CHAT_ID:
-        await update.message.reply_text("You are not authorized to use this command.")
         return
-
-    keyboard = [
-        [
-            InlineKeyboardButton("YES, I am sure", callback_data="clear_db_confirm"),
-            InlineKeyboardButton("NO, cancel", callback_data="clear_db_cancel"),
-        ]
-    ]
+    keyboard = [[
+        InlineKeyboardButton("YES, delete all data", callback_data="clear_db_confirm"),
+        InlineKeyboardButton("NO, cancel", callback_data="clear_db_cancel"),
+    ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "⚠️ WARNING! Are you sure you want to delete ALL user data from the database? This action cannot be undone.",
+        "⚠️ WARNING! Are you sure you want to delete ALL user data? This cannot be undone.",
         reply_markup=reply_markup
     )
 
 async def clear_db_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    action = query.data.split("_")[-1]
-
-    if action == "confirm":
+    if query.data.endswith("confirm"):
         clear_users_table()
-        await query.edit_message_text("✅ Database has been cleared successfully.")
+        await query.edit_message_text("✅ Database has been cleared.")
     else:
-        await query.edit_message_text("Database clearing operation cancelled.")
+        await query.edit_message_text("Operation cancelled.")
 
 # --- FLASK WEB SERVER ---
 app = Flask(__name__)
 @app.route("/")
-def index():
-    return "Bot is alive!"
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+def index(): return "Bot is alive!"
+def run_flask(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 # --- MAIN FUNCTION ---
 def main() -> None:
     if not all([TOKEN, ADMIN_CHAT_ID, DATABASE_URL]):
         print("ERROR: Missing one or more environment variables.")
         return
-    
-    print("Setting up database...")
-    setup_database()
-    print("Database setup complete.")
 
     application = Application.builder().token(TOKEN).build()
     
@@ -268,9 +250,14 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(button_handler, pattern='^(approve|decline)_'))
     application.add_handler(CallbackQueryHandler(clear_db_confirm, pattern='^clear_db_'))
 
+    # Запускаем "тяжелую" настройку базы в отдельном потоке
+    db_thread = threading.Thread(target=setup_database_in_background)
+    db_thread.start()
+    
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
-    print("Bot is starting...")
+    
+    print("Bot is starting polling immediately...")
     application.run_polling()
 
 if __name__ == "__main__":
