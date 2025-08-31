@@ -30,13 +30,8 @@ DB_READY = False
 # --- VALIDATION FUNCTIONS ---
 
 def is_valid_video_link(text: str) -> bool:
+    """Проверяет, является ли текст ссылкой на TikTok или YouTube Shorts."""
     return "tiktok.com" in text or "youtube.com/shorts/" in text
-
-def is_valid_card_number(card_number: str) -> bool:
-    return re.fullmatch(r"\d{16}", card_number) is not None
-
-def is_valid_usdt_address(address: str) -> bool:
-    return re.fullmatch(r"T[a-zA-Z0-9]{33}", address) is not None
 
 # --- DATABASE FUNCTIONS ---
 def get_db_connection():
@@ -146,18 +141,26 @@ async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
             return TYPING_USDT
 
 async def save_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    card_number = re.sub(r'[\s-]', '', update.message.text)
-    if is_valid_card_number(card_number):
+    """Сохраняет номер карты после новой, более простой валидации."""
+    # Извлекаем из строки только цифры
+    card_number = "".join(filter(str.isdigit, update.message.text))
+    
+    # Проверяем, что их ровно 16
+    if len(card_number) == 16:
         save_user_data(update.effective_user.id, "Russian Card", card_number)
         await update.message.reply_text("Thank you! Your card number is saved. You can now send your video link.")
         return ConversationHandler.END
     else:
-        await update.message.reply_text("Invalid format. Please enter 16 digits and try again.")
+        await update.message.reply_text("Invalid format. Please enter exactly 16 digits and try again.")
         return TYPING_CARD
 
 async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Сохраняет адрес USDT после новой, более простой валидации."""
+    # Убираем пробелы по краям
     usdt_address = update.message.text.strip()
-    if is_valid_usdt_address(usdt_address):
+    
+    # Проверяем формат
+    if usdt_address.startswith("T") and len(usdt_address) == 34:
         save_user_data(update.effective_user.id, "USDT (TRC-20)", usdt_address)
         await update.message.reply_text("Thank you! Your wallet address is saved. You can now send your video link.")
         return ConversationHandler.END
@@ -262,3 +265,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
