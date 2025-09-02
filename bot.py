@@ -28,7 +28,12 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 # --- API & SCRAPING FUNCTIONS ---
+
 def get_video_stats(url: str) -> dict:
+    """
+    Universal function to collect statistics.
+    Returns a dictionary with data or an error.
+    """
     stats = {"platform": "Unknown", "views": "N/A", "likes": "N/A", "comments": "N/A", "error": None}
     headers = {
         'User-Agent': (
@@ -84,15 +89,17 @@ def get_video_stats(url: str) -> dict:
         stats["error"] = "Request timed out."
     except Exception as e:
         stats["error"] = f"An error occurred: {str(e)}"
-
+    
     return stats
 
 
 # --- DATABASE FUNCTIONS ---
 def get_db_connection():
+    """Establishes a connection to the database."""
     return psycopg2.connect(DATABASE_URL)
 
 def setup_database():
+    """Creates the users table if it does not exist."""
     conn = get_db_connection()
     with conn.cursor() as cur:
         cur.execute("""
@@ -106,6 +113,7 @@ def setup_database():
     conn.close()
 
 def save_user_data(user_id, method, details):
+    """Saves or updates user payment data."""
     conn = get_db_connection()
     with conn.cursor() as cur:
         cur.execute(
@@ -121,6 +129,7 @@ def save_user_data(user_id, method, details):
     conn.close()
 
 def clear_users_table():
+    """Completely clears the users table."""
     conn = get_db_connection()
     with conn.cursor() as cur:
         cur.execute("TRUNCATE TABLE users;")
@@ -134,69 +143,74 @@ SELECTING_METHOD, TYPING_CARD, TYPING_USDT = range(3)
 
 # --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    keyboard = [[InlineKeyboardButton("💳 Настроить оплату", callback_data="setup_payment")]]
+    """Handles the /start command."""
+    keyboard = [[InlineKeyboardButton("💳 Setup Payment", callback_data="setup_payment")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "Привет! 🚀 Отправь ссылку на видео (TikTok или YouTube) или настрой способ оплаты.",
+        "Welcome! 🚀 Send a video link (TikTok or YouTube) or set up your payment method.",
         reply_markup=reply_markup
     )
     return ConversationHandler.END
 
 
 async def setup_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Starts the payment setup conversation."""
     query = update.callback_query
     await query.answer()
     keyboard = [
-        [InlineKeyboardButton("💰 Баланс сайта (Промокод)", callback_data="payment_promo")],
-        [InlineKeyboardButton("💳 Российская карта", callback_data="payment_card")],
+        [InlineKeyboardButton("💰 Site Balance (Promo Code)", callback_data="payment_promo")],
+        [InlineKeyboardButton("💳 Card", callback_data="payment_card")],
         [InlineKeyboardButton("💎 USDT (TRC-20)", callback_data="payment_usdt")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text("Выбери способ оплаты:", reply_markup=reply_markup)
+    await query.edit_message_text("Choose your payment method:", reply_markup=reply_markup)
     return SELECTING_METHOD
 
 
 async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Processes the chosen payment method."""
     query = update.callback_query
     method = query.data.split("_")[1]
     await query.answer()
     if method == "promo":
         save_user_data(query.from_user.id, "Site Balance", "Promo Code will be provided.")
-        await query.edit_message_text("✅ Метод оплаты: Баланс сайта. Теперь отправь ссылку на видео.")
+        await query.edit_message_text("✅ Payment method: Site Balance. Now, send your video link.")
         return ConversationHandler.END
     elif method == "card":
-        await query.edit_message_text("Введите номер карты (16 цифр):")
+        await query.edit_message_text("Enter your card number (16 digits):")
         return TYPING_CARD
     elif method == "usdt":
-        await query.edit_message_text("Введите USDT (TRC-20) адрес:")
+        await query.edit_message_text("Enter your USDT (TRC-20) address:")
         return TYPING_USDT
 
 
 async def save_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Saves the card number after validation."""
     card_number = "".join(filter(str.isdigit, update.message.text))
     if len(card_number) == 16:
-        save_user_data(update.effective_user.id, "Russian Card", card_number)
-        await update.message.reply_text("✅ Карта сохранена. Отправь ссылку на видео.")
+        save_user_data(update.effective_user.id, "Card", card_number)
+        await update.message.reply_text("✅ Card saved. Send your video link.")
         return ConversationHandler.END
     else:
-        await update.message.reply_text("❌ Неверный формат. Нужно 16 цифр.")
+        await update.message.reply_text("❌ Invalid format. 16 digits required.")
         return TYPING_CARD
 
 
 async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Saves the USDT address after validation."""
     usdt_address = update.message.text.strip()
     if usdt_address.startswith("T") and len(usdt_address) == 34:
         save_user_data(update.effective_user.id, "USDT (TRC-20)", usdt_address)
-        await update.message.reply_text("✅ Кошелёк сохранён. Отправь ссылку на видео.")
+        await update.message.reply_text("✅ Wallet saved. Send your video link.")
         return ConversationHandler.END
     else:
-        await update.message.reply_text("❌ Неверный адрес USDT. Попробуйте снова.")
+        await update.message.reply_text("❌ Invalid USDT address. Please try again.")
         return TYPING_USDT
 
 
 # --- LOADING BAR ---
 async def animate_loading_bar(message, stop_event: asyncio.Event):
-    """Анимация загрузочного бара."""
+    """Animates a loading bar message."""
     total_blocks = 5
     progress = 0
     while not stop_event.is_set():
@@ -204,7 +218,7 @@ async def animate_loading_bar(message, stop_event: asyncio.Event):
         bar = "⬛" * filled + "⬜" * (total_blocks - filled)
         percent = (filled / total_blocks) * 100
         try:
-            await message.edit_text(f"🔎 Анализирую ссылку...\n[{bar}] {int(percent)}%")
+            await message.edit_text(f"🔎 Analyzing link...\n[{bar}] {int(percent)}%")
         except TelegramError:
             break
         progress += 1
@@ -213,6 +227,7 @@ async def animate_loading_bar(message, stop_event: asyncio.Event):
 
 # --- BACKGROUND PROCESS ---
 async def process_submission_in_background(context: ContextTypes.DEFAULT_TYPE):
+    """A background job to fetch data and send the report to the admin."""
     job_data = context.job.data
     user = job_data['user']
     video_url = job_data['video_url']
@@ -222,23 +237,23 @@ async def process_submission_in_background(context: ContextTypes.DEFAULT_TYPE):
     stats = await context.application.run_in_executor(None, get_video_stats, video_url)
 
     if stats.get('error'):
-        stats_text = f"❌ Ошибка: {stats['error']}"
+        stats_text = f"❌ Error: {stats['error']}"
     else:
         stats_text = (
-            f"📊 <b>{stats['platform']} Статистика</b>\n"
-            f"👀 Просмотры: {stats['views']}\n"
-            f"👍 Лайки: {stats['likes']}\n"
-            f"💬 Комментарии: {stats['comments']}"
+            f"📊 <b>{stats['platform']} Stats</b>\n"
+            f"👀 Views: {stats['views']}\n"
+            f"👍 Likes: {stats['likes']}\n"
+            f"💬 Comments: {stats['comments']}"
         )
 
     admin_text = (
-        f"<b>Новая заявка</b>\n"
-        f"<b>От:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
-        f"<b>Ссылка:</b> {video_url}\n\n{stats_text}"
+        f"<b>New Submission</b>\n"
+        f"<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
+        f"<b>Link:</b> {video_url}\n\n{stats_text}"
     )
     keyboard = [[
-        InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{user.id}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"decline_{user.id}"),
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
+        InlineKeyboardButton("❌ Decline", callback_data=f"decline_{user.id}"),
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -254,7 +269,7 @@ async def process_submission_in_background(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.edit_message_text(
             chat_id=user_chat_id,
             message_id=user_message_id,
-            text="✅ Спасибо! Ваша заявка отправлена на проверку."
+            text="✅ Thank you! Your submission has been sent for review."
         )
     except (TelegramError, KeyError):
         pass
@@ -262,12 +277,13 @@ async def process_submission_in_background(context: ContextTypes.DEFAULT_TYPE):
 
 # --- SUBMISSION HANDLER ---
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles incoming video link submissions."""
     message_text = update.message.text
     if not ("tiktok.com" in message_text or "youtube.com" in message_text or "youtu.be" in message_text):
-        await update.message.reply_text("❌ Принимаю только ссылки TikTok и YouTube.")
+        await update.message.reply_text("❌ I only accept TikTok and YouTube links.")
         return
 
-    loading_message = await update.message.reply_text("🔎 Анализирую ссылку...\n[⬜⬜⬜⬜⬜] 0%")
+    loading_message = await update.message.reply_text("🔎 Analyzing link...\n[⬜⬜⬜⬜⬜] 0%")
 
     stop_event = asyncio.Event()
     context.application.bot_data[f"stop_{loading_message.message_id}"] = stop_event
@@ -288,6 +304,7 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # --- BUTTON HANDLER ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles clicks on Approve/Decline buttons."""
     query = update.callback_query
     await query.answer()
     original_text = query.message.text_html
@@ -297,47 +314,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if action == "approve":
         await context.bot.send_message(
             chat_id=user_id,
-            text="🎉 Ваша заявка ОДОБРЕНА!\n\nСвяжитесь с нами при необходимости: personet.com@proton.me"
+            text="🎉 Your submission has been APPROVED!\n\nIf you have any questions, contact us: personet.com@proton.me"
         )
-        new_text_for_admin = f"{original_text}\n\n------\n<b>✅ ОДОБРЕНО {query.from_user.mention_html()}</b>"
+        new_text_for_admin = f"{original_text}\n\n------\n<b>✅ APPROVED by {query.from_user.mention_html()}</b>"
     elif action == "decline":
         await context.bot.send_message(
             chat_id=user_id,
-            text="😔 Ваша заявка отклонена."
+            text="😔 Your submission has been declined."
         )
-        new_text_for_admin = f"{original_text}\n\n------\n<b>❌ ОТКЛОНЕНО {query.from_user.mention_html()}</b>"
+        new_text_for_admin = f"{original_text}\n\n------\n<b>❌ DECLINED by {query.from_user.mention_html()}</b>"
 
     await query.edit_message_text(text=new_text_for_admin, parse_mode="HTML", reply_markup=None)
 
 
 # --- ADMIN COMMANDS ---
 async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the /clear_db command (admin only)."""
     if str(update.effective_user.id) != ADMIN_CHAT_ID:
         return
     keyboard = [[
-        InlineKeyboardButton("⚠️ УДАЛИТЬ ВСЕ ДАННЫЕ", callback_data="clear_db_confirm"),
-        InlineKeyboardButton("❌ Отмена", callback_data="clear_db_cancel"),
+        InlineKeyboardButton("⚠️ DELETE ALL DATA", callback_data="clear_db_confirm"),
+        InlineKeyboardButton("❌ Cancel", callback_data="clear_db_cancel"),
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "⚠️ ВНИМАНИЕ! Удалить ВСЕ данные пользователей?",
+        "⚠️ WARNING! Delete ALL user data?",
         reply_markup=reply_markup
     )
 
 async def clear_db_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the database clearing confirmation."""
     query = update.callback_query
     await query.answer()
     if query.data.endswith("confirm"):
         clear_users_table()
-        await query.edit_message_text("✅ База данных очищена.")
+        await query.edit_message_text("✅ Database cleared.")
     else:
-        await query.edit_message_text("Операция отменена.")
+        await query.edit_message_text("Operation cancelled.")
 
 
 # --- MAIN FUNCTION ---
 def main() -> None:
+    """Main function to set up and run the bot."""
     if not all([TOKEN, ADMIN_CHAT_ID, DATABASE_URL]):
-        print("❌ Ошибка: отсутствуют переменные окружения.")
+        print("❌ ERROR: Missing environment variables.")
         return
 
     setup_database()
@@ -361,9 +381,10 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(button_handler, pattern='^(approve|decline)_'))
     application.add_handler(CallbackQueryHandler(clear_db_confirm, pattern='^clear_db_'))
 
-    print("🤖 Бот запущен...")
+    print("🤖 Bot is running...")
     application.run_polling()
 
 
 if __name__ == "__main__":
     main()
+
