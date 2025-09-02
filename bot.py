@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 import os
 import re
+import threading
 import time
 import asyncio
 import psycopg2
 import requests
 from bs4 import BeautifulSoup
+from flask import Flask
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,6 +29,9 @@ TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+
+# --- ГЛОБАЛЬНЫЙ ФЛАГ ГОТОВНОСТИ БАЗЫ ДАННЫХ ---
+DB_READY = False
 
 # --- API & SCRAPING FUNCTIONS ---
 
@@ -110,13 +115,21 @@ def get_db_connection():
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
-def setup_database():
-    """Создает таблицу users, если она не существует."""
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, payment_method TEXT, payment_details TEXT);")
-        conn.commit()
-    conn.close()
+def setup_database_in_background():
+    global DB_READY
+    print("Starting background database setup...")
+    while not DB_READY:
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, payment_method TEXT, payment_details TEXT);")
+                conn.commit()
+            conn.close()
+            DB_READY = True
+            print("✅ Background database setup complete.")
+        except Exception as e:
+            print(f"Error setting up database: {e}. Retrying in 5 seconds...")
+            time.sleep(5)
 
 def save_user_data(user_id, method, details):
     conn = get_db_connection()
@@ -149,6 +162,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def setup_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    if not DB_READY:
+        await query.edit_message_text("The database is warming up. Please try again in a few seconds.")
+        return ConversationHandler.END
     keyboard = [
         [InlineKeyboardButton("Site Balance (Promo Code)", callback_data="payment_promo")],
         [InlineKeyboardButton("Russian Card", callback_data="payment_card")],
@@ -200,7 +216,6 @@ async def fetch_and_update_stats(context: ContextTypes.DEFAULT_TYPE):
     user = job_context["user"]
     message_text = job_context["message_text"]
     admin_message_id = job_context["admin_message_id"]
-    stats_link = job_context["stats_link"]
 
     stats_text = await context.application.run_in_executor(
         None, get_stats_blocking, message_text
@@ -209,8 +224,7 @@ async def fetch_and_update_stats(context: ContextTypes.DEFAULT_TYPE):
     new_admin_text = (
         f"<b>New Submission</b>\n\n"
         f"<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
-        f"<b>Video Link:</b> <a href=\"{message_text}\">Click to watch</a>\n"
-        f"<b>External Stats (Social Blade):</b> <a href=\"{stats_link}\">Click here</a>\n\n"
+        f"<b>Video Link:</b> <a href=\"{message_text}\">Click to watch</a>\n\n"
         f"--------------------\n"
         f"{stats_text}"
     )
@@ -239,17 +253,10 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     user = update.effective_user
     
-    stats_link = message_text
-    if "youtube.com" in message_text or "youtu.be" in message_text:
-        video_id = extract_youtube_id(message_text)
-        if video_id:
-            stats_link = f"https://socialblade.com/youtube/video/{video_id}"
-
     initial_admin_text = (
         f"<b>New Submission</b>\n\n"
         f"<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
-        f"<b>Video Link:</b> <a href=\"{message_text}\">Click to watch</a>\n"
-        f"<b>External Stats (Social Blade):</b> <a href=\"{stats_link}\">Click here</a>\n\n"
+        f"<b>Video Link:</b> <a href=\"{message_text}\">Click to watch</a>\n\n"
         f"--------------------\n"
         f"⏳ Fetching stats..."
     )
@@ -263,8 +270,7 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         data={
             "user": user,
             "message_text": message_text,
-            "admin_message_id": admin_message.message_id,
-            "stats_link": stats_link
+            "admin_message_id": admin_message.message_id
         },
         name=f"stats_{user.id}_{admin_message.message_id}"
     )
@@ -313,15 +319,17 @@ async def clear_db_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         await query.edit_message_text("Operation cancelled.")
 
+# --- FLASK WEB SERVER ---
+app = Flask(__name__)
+@app.route("/")
+def index(): return "Bot is alive!"
+def run_flask(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 # --- MAIN FUNCTION ---
 def main() -> None:
     if not all([TOKEN, ADMIN_CHAT_ID, DATABASE_URL]):
         print("ERROR: Missing one or more environment variables.")
         return
-
-    print("Setting up database...")
-    setup_database()
-    print("Database setup complete.")
 
     application = Application.builder().token(TOKEN).build()
     
@@ -341,8 +349,13 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_submission))
     application.add_handler(CallbackQueryHandler(button_handler, pattern='^(approve|decline)_'))
     application.add_handler(CallbackQueryHandler(clear_db_confirm, pattern='^clear_db_'))
+
+    db_thread = threading.Thread(target=setup_database_in_background)
+    db_thread.start()
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
     
-    print("Bot is starting...")
+    print("Bot is starting polling immediately...")
     application.run_polling()
 
 if __name__ == "__main__":
