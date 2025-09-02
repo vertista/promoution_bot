@@ -1,6 +1,6 @@
-python-telegram-bot
+python-telegram-bot[ext]~=20.0
 psycopg2-binary
 python-dotenv
 google-api-python-client
 beautifulsoup4
-requests
+aiohttp
