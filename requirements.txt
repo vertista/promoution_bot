@@ -1,7 +1,2 @@
 python-telegram-bot
-psycopg2-binary
-Flask
 python-dotenv
-google-api-python-client
-beautifulsoup4
-requests
