@@ -3,7 +3,7 @@ import os
 import re
 import threading
 import time
-import asyncio
+import asyncio # Добавили библиотеку для асинхронной анимации
 import psycopg2
 import requests
 from bs4 import BeautifulSoup
@@ -53,7 +53,7 @@ def get_youtube_video_stats(video_id: str) -> str:
         comments = int(stats.get('commentCount', 0))
         
         return (
-            f"📊 <b>YouTube Stats</b>\n"
+            f"📊 **YouTube Stats**\n"
             f"👀 Views: {views:,}\n"
             f"👍 Likes: {likes:,}\n"
             f"💬 Comments: {comments:,}"
@@ -68,6 +68,7 @@ def get_tiktok_video_stats(url: str) -> str:
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     try:
+        # Устанавливаем таймаут в 10 секунд, чтобы бот не зависал
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -81,13 +82,12 @@ def get_tiktok_video_stats(url: str) -> str:
         comments = comments_tag.text if comments_tag else 'N/A'
 
         return (
-            f"📊 <b>TikTok Stats</b>\n"
+            f"📊 **TikTok Stats**\n"
             f"👀 Views: {views}\n"
             f"👍 Likes: {likes}\n"
             f"💬 Comments: {comments}"
         )
     except requests.exceptions.Timeout:
-        print("TikTok Scraping Error: Request timed out.")
         return "Could not fetch TikTok stats: request timed out."
     except Exception as e:
         print(f"TikTok Scraping Error: {e}")
@@ -100,7 +100,10 @@ def extract_youtube_id(url: str):
     return match.group(1) if match else None
 
 def get_stats_blocking(url: str) -> str:
-    """Блокирующая функция для получения статистики."""
+    """
+    Блокирующая функция для получения статистики.
+    Будет выполняться в отдельном потоке, не мешая боту.
+    """
     if "tiktok.com" in url:
         return get_tiktok_video_stats(url)
     else:
@@ -143,6 +146,7 @@ def save_user_data(user_id, method, details):
     conn.close()
 
 def clear_users_table():
+    """Полностью очищает таблицу users."""
     conn = get_db_connection()
     with conn.cursor() as cur:
         cur.execute("TRUNCATE TABLE users;")
@@ -210,40 +214,17 @@ async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Invalid USDT address format. Please try again.")
         return TYPING_USDT
 
-async def fetch_and_update_stats(context: ContextTypes.DEFAULT_TYPE):
-    """Фоновая задача для получения статистики и обновления сообщения админа."""
-    job_context = context.job.data
-    user = job_context["user"]
-    message_text = job_context["message_text"]
-    admin_message_id = job_context["admin_message_id"]
-
-    stats_text = await context.application.run_in_executor(
-        None, get_stats_blocking, message_text
-    )
-
-    new_admin_text = (
-        f"<b>New Submission</b>\n\n"
-        f"<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
-        f"<b>Video Link:</b> <a href=\"{message_text}\">Click to watch</a>\n\n"
-        f"--------------------\n"
-        f"{stats_text}"
-    )
-    keyboard = [[
-        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
-        InlineKeyboardButton("❌ Decline", callback_data=f"decline_{user.id}"),
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    try:
-        await context.bot.edit_message_text(
-            chat_id=ADMIN_CHAT_ID,
-            message_id=admin_message_id,
-            text=new_admin_text,
-            reply_markup=reply_markup,
-            parse_mode="HTML"
-        )
-    except TelegramError as e:
-        print(f"Could not edit admin message: {e}")
+async def animate_loading(message: Update.message, stop_event: asyncio.Event):
+    """Анимирует сообщение о загрузке."""
+    animation_frames = ["⢿", "⣻", "⣽", "⣾", "⣷", "⣯", "⣟", "⡿"]
+    i = 0
+    while not stop_event.is_set():
+        try:
+            await message.edit_text(f"Analyzing link... {animation_frames[i % len(animation_frames)]}")
+            i += 1
+            await asyncio.sleep(0.2)
+        except TelegramError:
+            break
 
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message_text = update.message.text
@@ -251,73 +232,78 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Sorry, I only accept links from TikTok and YouTube.")
         return
 
-    user = update.effective_user
-    
-    initial_admin_text = (
-        f"<b>New Submission</b>\n\n"
-        f"<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
-        f"<b>Video Link:</b> <a href=\"{message_text}\">Click to watch</a>\n\n"
-        f"--------------------\n"
-        f"⏳ Fetching stats..."
-    )
-    admin_message = await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID, text=initial_admin_text, parse_mode="HTML"
+    stop_event = asyncio.Event()
+    loading_msg = await update.message.reply_text("Analyzing link... ⢿")
+    animation_task = asyncio.create_task(animate_loading(loading_msg, stop_event))
+
+    stats_text = await context.application.run_in_executor(
+        None, get_stats_blocking, message_text
     )
 
-    context.job_queue.run_once(
-        fetch_and_update_stats, 
-        when=1,
-        data={
-            "user": user,
-            "message_text": message_text,
-            "admin_message_id": admin_message.message_id
-        },
-        name=f"stats_{user.id}_{admin_message.message_id}"
+    stop_event.set()
+    await animation_task
+
+    user = update.effective_user
+    admin_message_text = (
+        f"New submission from: {user.mention_html()} (`{user.id}`)\n\n"
+        f"Link: {message_text}\n\n"
+        f"----\n{stats_text}"
+    )
+    keyboard = [[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
+        InlineKeyboardButton("❌ Decline", callback_data=f"decline_{user.id}"),
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID, text=admin_message_text, reply_markup=reply_markup, parse_mode="HTML"
     )
     
-    await update.message.reply_text("Thank you! Your submission has been sent for review.")
+    await loading_msg.edit_text("Thank you! Your submission has been sent for review.")
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
-    original_text = query.message.text_html
     action, user_id_str = query.data.split("_")
     user_id = int(user_id_str)
-
     if action == "approve":
-        response_text_to_user = "Congratulations! Your submission has been APPROVED.\n\nIf you have any questions, please contact us at: personet.com@proton.me"
-        new_text_for_admin = f"{original_text}\n\n------\n<b>✅ STATUS: APPROVED by {query.from_user.mention_html()}</b>"
-        
-        await query.edit_message_text(text=new_text_for_admin, parse_mode="HTML", reply_markup=None)
-        await context.bot.send_message(chat_id=user_id, text=response_text_to_user)
-    
-    elif action == "decline":
-        response_text_to_user = "We are sorry, but your submission has been DECLINED."
-        new_text_for_admin = f"{original_text}\n\n------\n<b>❌ STATUS: DECLINED by {query.from_user.mention_html()}</b>"
-        
-        await query.edit_message_text(text=new_text_for_admin, parse_mode="HTML", reply_markup=None)
-        await context.bot.send_message(chat_id=user_id, text=response_text_to_user)
+        response_text = "Congratulations! Your submission has been APPROVED."
+        await query.edit_message_text(text=f"✅ APPROVED for user {user_id}.")
+    else:
+        response_text = "We are sorry, but your submission has been DECLINED."
+        await query.edit_message_text(text=f"❌ DECLINED for user {user_id}.")
+    await context.bot.send_message(chat_id=user_id, text=response_text)
 
 # --- ADMIN COMMANDS ---
 async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if str(update.effective_user.id) != ADMIN_CHAT_ID: return
-    keyboard = [[
-        InlineKeyboardButton("YES, delete all data", callback_data="clear_db_confirm"),
-        InlineKeyboardButton("NO, cancel", callback_data="clear_db_cancel"),
-    ]]
+    """Команда для очистки базы данных (только для админа)."""
+    if str(update.effective_user.id) != ADMIN_CHAT_ID:
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton("YES, I am sure", callback_data="clear_db_confirm"),
+            InlineKeyboardButton("NO, cancel", callback_data="clear_db_cancel"),
+        ]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("⚠️ WARNING! Are you sure you want to delete ALL user data? This cannot be undone.", reply_markup=reply_markup)
+    await update.message.reply_text(
+        "⚠️ WARNING! Are you sure you want to delete ALL user data from the database? This action cannot be undone.",
+        reply_markup=reply_markup
+    )
 
 async def clear_db_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик подтверждения очистки базы."""
     query = update.callback_query
     await query.answer()
-    if query.data.endswith("confirm"):
+    action = query.data.split("_")[-1]
+
+    if action == "confirm":
         clear_users_table()
-        await query.edit_message_text("✅ Database has been cleared.")
+        await query.edit_message_text("✅ Database has been cleared successfully.")
     else:
-        await query.edit_message_text("Operation cancelled.")
+        await query.edit_message_text("Database clearing operation cancelled.")
 
 # --- FLASK WEB SERVER ---
 app = Flask(__name__)
