@@ -27,59 +27,59 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
-# --- API & SCRAPING FUNCTIONS (НОВАЯ, РАЗДЕЛЕННАЯ ЛОГИКА) ---
+# --- API & SCRAPING FUNCTIONS ---
 
-def get_youtube_stats_from_url(url: str) -> dict:
-    """Получает статистику ТОЛЬКО для YouTube."""
-    stats = {"platform": "YouTube", "views": "N/A", "likes": "N/A", "comments": "N/A", "error": None}
-    
-    if not YOUTUBE_API_KEY:
-        stats["error"] = "YouTube API key not configured."
-        return stats
-    
-    video_id_match = re.search(r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|embed\/|v\/|shorts\/)?([a-zA-Z0-9_-]{11})", url)
-    if not video_id_match:
-        stats["error"] = "Could not parse YouTube link."
-        return stats
-    
-    video_id = video_id_match.group(1)
-    
-    try:
-        youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
-        request = youtube.videos().list(part="statistics", id=video_id)
-        response = request.execute()
-
-        if not response.get('items'):
-            stats["error"] = "Video not found or private."
-            return stats
-
-        raw_stats = response['items'][0]['statistics']
-        stats["views"] = f"{int(raw_stats.get('viewCount', 0)):,}"
-        stats["likes"] = f"{int(raw_stats.get('likeCount', 0)):,}"
-        stats["comments"] = f"{int(raw_stats.get('commentCount', 0)):,}"
-    except Exception as e:
-        stats["error"] = f"An error occurred: {str(e)}"
-    
-    return stats
-
-def get_tiktok_stats_from_url(url: str) -> dict:
-    """Получает статистику ТОЛЬКО для TikTok."""
-    stats = {"platform": "TikTok", "views": "N/A", "likes": "N/A", "comments": "N/A", "error": None}
+def get_video_stats(url: str) -> dict:
+    """
+    Универсальная функция для сбора статистики.
+    Возвращает словарь с данными или ошибкой.
+    """
+    stats = {"platform": "Unknown", "views": "N/A", "likes": "N/A", "comments": "N/A", "error": None}
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
 
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
+        if "tiktok.com" in url:
+            stats["platform"] = "TikTok"
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            stats["views"] = soup.find('strong', {'data-e2e': 'view-count'}).text
+            stats["likes"] = soup.find('strong', {'data-e2e': 'like-count'}).text
+            stats["comments"] = soup.find('strong', {'data-e2e': 'comment-count'}).text
         
-        stats["views"] = soup.find('strong', {'data-e2e': 'view-count'}).text
-        stats["likes"] = soup.find('strong', {'data-e2e': 'like-count'}).text
-        stats["comments"] = soup.find('strong', {'data-e2e': 'comment-count'}).text
+        elif "youtube.com" in url or "youtu.be" in url:
+            stats["platform"] = "YouTube"
+            if not YOUTUBE_API_KEY:
+                stats["error"] = "YouTube API key not configured."
+                return stats
+            
+            video_id_match = re.search(r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|embed\/|v\/|shorts\/)?([a-zA-Z0-9_-]{11})", url)
+            if not video_id_match:
+                stats["error"] = "Could not parse YouTube link."
+                return stats
+            
+            video_id = video_id_match.group(1)
+            youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+            request = youtube.videos().list(part="statistics", id=video_id)
+            response = request.execute()
+
+            if not response.get('items'):
+                stats["error"] = "Video not found or private."
+                return stats
+
+            raw_stats = response['items'][0]['statistics']
+            stats["views"] = f"{int(raw_stats.get('viewCount', 0)):,}"
+            stats["likes"] = f"{int(raw_stats.get('likeCount', 0)):,}"
+            stats["comments"] = f"{int(raw_stats.get('commentCount', 0)):,}"
+        
+        else:
+            stats["error"] = "Unsupported link."
+
     except requests.exceptions.Timeout:
         stats["error"] = "Request timed out."
     except Exception as e:
         stats["error"] = f"An error occurred: {str(e)}"
-        
+    
     return stats
 
 # --- DATABASE FUNCTIONS ---
@@ -169,38 +169,30 @@ async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Invalid USDT address format. Please try again.")
         return TYPING_USDT
 
-async def fetch_stats_and_update_admin_message(context: ContextTypes.DEFAULT_TYPE):
-    """Фоновая задача для получения статистики и обновления сообщения."""
+async def animate_loading_message(message: Update.message, stop_event: asyncio.Event):
+    """Анимирует сообщение для пользователя."""
+    animation_frames = ["⢿", "⣻", "⣽", "⣾", "⣷", "⣯", "⣟", "⡿"]
+    i = 0
+    while not stop_event.is_set():
+        try:
+            await message.edit_text(f"Analyzing link... {animation_frames[i % len(animation_frames)]}")
+            i += 1
+            await asyncio.sleep(0.2)
+        except TelegramError:
+            break
+
+async def process_submission_in_background(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача для сбора данных и отправки отчета админу."""
     job_data = context.job.data
-    admin_message_id = job_data['admin_message_id']
     user = job_data['user']
     video_url = job_data['video_url']
+    user_message_id = job_data['user_message_id']
+    user_chat_id = job_data['user_chat_id']
 
-    # Этап 1: Анимация для админа
-    animation_frames = ['[▱▱▱▱▱]', '[▰▱▱▱▱]', '[▰▰▱▱▱]', '[▰▰▰▱▱]', '[▰▰▰▰▱]', '[▰▰▰▰▰]']
-    base_text = f"<b>New Submission</b>\n<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n<b>Link:</b> {video_url}\n\n"
+    # Запускаем сбор данных в отдельном потоке, чтобы не блокировать асинхронный код
+    stats = await context.application.run_in_executor(None, get_video_stats, video_url)
     
-    for frame in animation_frames:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=ADMIN_CHAT_ID,
-                message_id=admin_message_id,
-                text=base_text + f"📊 Stats: {frame} Fetching...",
-                parse_mode="HTML"
-            )
-            await asyncio.sleep(0.5)
-        except TelegramError:
-            pass 
-
-    # Этап 2: Сбор данных (НОВАЯ ЛОГИКА)
-    if "tiktok.com" in video_url:
-        stats = await context.application.run_in_executor(None, get_tiktok_stats_from_url, video_url)
-    elif "youtube.com" in video_url or "youtu.be" in video_url:
-        stats = await context.application.run_in_executor(None, get_youtube_stats_from_url, video_url)
-    else:
-        stats = {"error": "Unsupported link."}
-    
-    # Этап 3: Финальный отчет
+    # Готовим отчет для админа
     stats_text = ""
     if stats.get('error'):
         stats_text = f"❌ <b>Error:</b> {stats['error']}"
@@ -212,23 +204,36 @@ async def fetch_stats_and_update_admin_message(context: ContextTypes.DEFAULT_TYP
             f"💬 Comments: {stats['comments']}"
         )
     
-    final_text = base_text + stats_text
+    admin_text = (
+        f"<b>New Submission</b>\n<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
+        f"<b>Link:</b> {video_url}\n\n{stats_text}"
+    )
     keyboard = [[
         InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
         InlineKeyboardButton("❌ Decline", callback_data=f"decline_{user.id}"),
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    # Отправляем финальный отчет админу
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=admin_text,
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
+
+    # Уведомляем пользователя, что все готово
     try:
+        # Сначала нужно остановить анимацию, отправив событие
+        context.application.bot_data[f"stop_{user_message_id}"].set()
+        # Редактируем сообщение пользователя
         await context.bot.edit_message_text(
-            chat_id=ADMIN_CHAT_ID,
-            message_id=admin_message_id,
-            text=final_text,
-            reply_markup=reply_markup,
-            parse_mode="HTML"
+            chat_id=user_chat_id,
+            message_id=user_message_id,
+            text="Thank you! Your submission has been sent for review."
         )
-    except TelegramError as e:
-        print(f"Could not edit final admin message: {e}")
+    except (TelegramError, KeyError) as e:
+        print(f"Could not edit user message: {e}")
 
 
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -237,27 +242,27 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Sorry, I only accept links from TikTok and YouTube.")
         return
 
-    # Мгновенно отвечаем пользователю
-    await update.message.reply_text("Thank you! Your submission has been sent for review.")
+    # 1. Мгновенно отправляем пользователю сообщение с анимацией
+    loading_message = await update.message.reply_text("Analyzing link... ⢿")
 
-    user = update.effective_user
-    
-    # Отправляем админу сообщение-заглушку
-    initial_admin_text = (
-        f"<b>New Submission</b>\n<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
-        f"<b>Link:</b> {message_text}\n\n📊 Stats: [⏳] Queued..."
-    )
-    admin_message = await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID, text=initial_admin_text, parse_mode="HTML"
-    )
+    # 2. Создаем событие для остановки анимации
+    stop_event = asyncio.Event()
+    context.application.bot_data[f"stop_{loading_message.message_id}"] = stop_event
 
-    # Запускаем фоновую задачу для сбора данных и анимации
+    # 3. Запускаем саму анимацию и сбор данных в фоновом режиме
+    asyncio.create_task(animate_loading_message(loading_message, stop_event))
     context.job_queue.run_once(
-        fetch_stats_and_update_admin_message,
-        when=1,
-        data={'admin_message_id': admin_message.message_id, 'user': user, 'video_url': message_text},
-        name=f"stats_{user.id}_{admin_message.message_id}"
+        process_submission_in_background,
+        when=1, # Запустить почти сразу
+        data={
+            'user': update.effective_user,
+            'video_url': message_text,
+            'user_message_id': loading_message.message_id,
+            'user_chat_id': update.effective_chat.id
+        },
+        name=f"process_{update.effective_message.id}"
     )
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
