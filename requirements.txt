@@ -1,7 +1,6 @@
-python-telegram-bot
-psycopg2-binary
-python-dotenv
-google-api-python-client
-beautifulsoup4
-aiohttp
-redis
+python-telegram-bot==20.8
+psycopg2-binary==2.9.9
+python-dotenv==1.0.1
+google-api-python-client==2.133.0
+beautifulsoup4==4.12.3
+requests==2.32.3
