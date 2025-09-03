@@ -7,7 +7,6 @@ import psycopg2
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from googleapiclient.discovery import build
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -21,11 +20,7 @@ from telegram.ext import (
 )
 
 # --- LOGGING ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.DEBUG,
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -36,9 +31,43 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 # --- API & SCRAPING FUNCTIONS ---
+
+def get_youtube_stats(video_id: str) -> dict:
+    """Fetch YouTube stats directly via REST API."""
+    stats = {"platform": "YouTube", "views": "N/A", "likes": "N/A", "comments": "N/A", "error": None}
+    try:
+        url = (
+            f"https://www.googleapis.com/youtube/v3/videos"
+            f"?part=statistics&id={video_id}&key={YOUTUBE_API_KEY}"
+        )
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        if not data.get("items"):
+            stats["error"] = "Video not found or private."
+            return stats
+
+        raw = data["items"][0]["statistics"]
+        stats["views"] = f"{int(raw.get('viewCount', 0)):,}"
+        stats["likes"] = f"{int(raw.get('likeCount', 0)):,}"
+        stats["comments"] = f"{int(raw.get('commentCount', 0)):,}"
+    except requests.exceptions.Timeout:
+        stats["error"] = "YouTube API request timed out."
+    except Exception as e:
+        stats["error"] = f"Error: {str(e)}"
+    return stats
+
+
 def get_video_stats(url: str) -> dict:
     stats = {"platform": "Unknown", "views": "N/A", "likes": "N/A", "comments": "N/A", "error": None}
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/91.0.4472.124 Safari/537.36'
+        )
+    }
 
     try:
         if "tiktok.com" in url:
@@ -46,18 +75,15 @@ def get_video_stats(url: str) -> dict:
             response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
-
-            views = soup.find('strong', {'data-e2e': 'view-count'})
-            likes = soup.find('strong', {'data-e2e': 'like-count'})
-            comments = soup.find('strong', {'data-e2e': 'comment-count'})
-
-            if not views or not likes or not comments:
+            view = soup.find('strong', {'data-e2e': 'view-count'})
+            like = soup.find('strong', {'data-e2e': 'like-count'})
+            comment = soup.find('strong', {'data-e2e': 'comment-count'})
+            if not (view and like and comment):
                 stats["error"] = "Could not parse TikTok stats."
-                return stats
-
-            stats["views"] = views.text
-            stats["likes"] = likes.text
-            stats["comments"] = comments.text
+            else:
+                stats["views"] = view.text
+                stats["likes"] = like.text
+                stats["comments"] = comment.text
 
         elif "youtube.com" in url or "youtu.be" in url:
             stats["platform"] = "YouTube"
@@ -66,7 +92,7 @@ def get_video_stats(url: str) -> dict:
                 return stats
 
             video_id_match = re.search(
-                r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|embed\/|v\/|shorts\/)?([a-zA-Z0-9_-]{11})",
+                r"(?:youtube\.com/(?:.*v=|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})",
                 url
             )
             if not video_id_match:
@@ -74,18 +100,7 @@ def get_video_stats(url: str) -> dict:
                 return stats
 
             video_id = video_id_match.group(1)
-            youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
-            request = youtube.videos().list(part="statistics", id=video_id)
-            response = request.execute()
-
-            if not response.get('items'):
-                stats["error"] = "Video not found or private."
-                return stats
-
-            raw_stats = response['items'][0]['statistics']
-            stats["views"] = f"{int(raw_stats.get('viewCount', 0)):,}"
-            stats["likes"] = f"{int(raw_stats.get('likeCount', 0)):,}"
-            stats["comments"] = f"{int(raw_stats.get('commentCount', 0)):,}"
+            return get_youtube_stats(video_id)
 
         else:
             stats["error"] = "Unsupported link."
@@ -93,8 +108,8 @@ def get_video_stats(url: str) -> dict:
     except requests.exceptions.Timeout:
         stats["error"] = "Request timed out."
     except Exception as e:
-        stats["error"] = f"Error: {str(e)}"
-
+        stats["error"] = f"An error occurred: {str(e)}"
+    
     return stats
 
 # --- DATABASE FUNCTIONS ---
@@ -102,31 +117,113 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
 
 def setup_database():
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    payment_method TEXT,
-                    payment_details TEXT
-                );
-            """)
-            conn.commit()
-        conn.close()
-        logger.info("✅ Database initialized")
-    except Exception as e:
-        logger.error(f"❌ Database error: {e}")
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                payment_method TEXT,
+                payment_details TEXT
+            );
+        """)
+        conn.commit()
+    conn.close()
 
-# --- HELPERS ---
+def save_user_data(user_id, method, details):
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO users (user_id, payment_method, payment_details) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET payment_method = %s, payment_details = %s;",
+            (user_id, method, details, method, details),
+        )
+        conn.commit()
+    conn.close()
+
+def clear_users_table():
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE TABLE users;")
+        conn.commit()
+    conn.close()
+
+# --- BOT STATES ---
+SELECTING_METHOD, TYPING_CARD, TYPING_USDT = range(3)
+
+# --- BOT HANDLERS ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyboard = [[InlineKeyboardButton("Setup Payment Details", callback_data="setup_payment")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "Welcome! Please set up your payment details or send your video link.",
+        reply_markup=reply_markup
+    )
+    return ConversationHandler.END
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Bot is alive!")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Commands:\n/start - restart\n/ping - check bot\n/clear_db - reset users")
+
+async def setup_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    keyboard = [
+        [InlineKeyboardButton("Site Balance (Promo Code)", callback_data="payment_promo")],
+        [InlineKeyboardButton("Russian Card", callback_data="payment_card")],
+        [InlineKeyboardButton("USDT (TRC-20)", callback_data="payment_usdt")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("Please choose your preferred payment method:", reply_markup=reply_markup)
+    return SELECTING_METHOD
+
+async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    method = query.data.split("_")[1]
+    await query.answer()
+    if method == "promo":
+        save_user_data(query.from_user.id, "Site Balance", "Promo Code will be provided.")
+        await query.edit_message_text("Great! Payment method set to 'Site Balance'. You can now send your video link.")
+        return ConversationHandler.END
+    elif method == "card":
+        await query.edit_message_text("Please enter your Russian card number (16 digits):")
+        return TYPING_CARD
+    elif method == "usdt":
+        await query.edit_message_text("Please enter your USDT (TRC-20) wallet address:")
+        return TYPING_USDT
+
+async def save_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    card_number = "".join(filter(str.isdigit, update.message.text))
+    if len(card_number) == 16:
+        save_user_data(update.effective_user.id, "Russian Card", card_number)
+        await update.message.reply_text("Thank you! Your card number is saved. You can now send your video link.")
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("Invalid format. Please enter exactly 16 digits and try again.")
+        return TYPING_CARD
+
+async def save_usdt_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    usdt_address = update.message.text.strip()
+    if usdt_address.startswith("T") and len(usdt_address) == 34:
+        save_user_data(update.effective_user.id, "USDT (TRC-20)", usdt_address)
+        await update.message.reply_text("Thank you! Your wallet address is saved. You can now send your video link.")
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("Invalid USDT address format. Please try again.")
+        return TYPING_USDT
+
 async def animate_loading_message(message, stop_event: asyncio.Event):
-    frames = ["🔄", "⏳", "⌛", "🔃", "🌀"]
+    """Loading bar animation for user."""
+    frames = ["░░░░░░░░░░", "█░░░░░░░░░", "██░░░░░░░░", "███░░░░░░░",
+              "████░░░░░░", "█████░░░░░", "██████░░░░", "███████░░░",
+              "████████░░", "█████████░", "██████████"]
     i = 0
     while not stop_event.is_set():
         try:
             await message.edit_text(f"Analyzing link... {frames[i % len(frames)]}")
             i += 1
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         except TelegramError:
             break
 
@@ -139,15 +236,18 @@ async def process_submission_in_background(context: ContextTypes.DEFAULT_TYPE):
 
     stats = await context.application.run_in_executor(None, get_video_stats, video_url)
 
-    stats_text = "❌ Error: " + stats['error'] if stats.get('error') else (
-        f"📊 {stats['platform']} Stats\n"
-        f"👀 Views: {stats['views']}\n"
-        f"👍 Likes: {stats['likes']}\n"
-        f"💬 Comments: {stats['comments']}"
-    )
+    if stats.get('error'):
+        stats_text = f"❌ <b>Error:</b> {stats['error']}"
+    else:
+        stats_text = (
+            f"📊 <b>{stats['platform']} Stats</b> [✅ OK]\n"
+            f"👀 Views: {stats['views']}\n"
+            f"👍 Likes: {stats['likes']}\n"
+            f"💬 Comments: {stats['comments']}"
+        )
 
     admin_text = (
-        f"<b>New Submission</b>\n<b>User:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
+        f"<b>New Submission</b>\n<b>From:</b> {user.mention_html()} (<code>{user.id}</code>)\n"
         f"<b>Link:</b> {video_url}\n\n{stats_text}"
     )
     keyboard = [[
@@ -156,31 +256,31 @@ async def process_submission_in_background(context: ContextTypes.DEFAULT_TYPE):
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text, reply_markup=reply_markup, parse_mode="HTML")
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=admin_text,
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
 
     try:
         context.application.bot_data[f"stop_{user_message_id}"].set()
-        await context.bot.edit_message_text(chat_id=user_chat_id, message_id=user_message_id, text="✅ Submission sent for review!")
-    except Exception as e:
-        logger.error(f"Could not edit user message: {e}")
-
-# --- HANDLERS ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome! Send me a TikTok or YouTube link for analysis.")
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ℹ️ Commands:\n/start - welcome\n/help - this help\n/ping - check bot status")
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot is alive!")
+        await context.bot.edit_message_text(
+            chat_id=user_chat_id,
+            message_id=user_message_id,
+            text="Thank you! Your submission has been sent for review."
+        )
+    except (TelegramError, KeyError) as e:
+        logging.warning(f"Could not edit user message: {e}")
 
 async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message_text = update.message.text
-    if not any(x in message_text for x in ("tiktok.com", "youtube.com", "youtu.be")):
-        await update.message.reply_text("❌ Only TikTok or YouTube links are accepted.")
+    if not ("tiktok.com" in message_text or "youtube.com" in message_text or "youtu.be" in message_text):
+        await update.message.reply_text("Sorry, I only accept links from TikTok and YouTube.")
         return
 
-    loading_message = await update.message.reply_text("Analyzing link... ⏳")
+    loading_message = await update.message.reply_text("Analyzing link... ░░░░░░░░░░")
+
     stop_event = asyncio.Event()
     context.application.bot_data[f"stop_{loading_message.message_id}"] = stop_event
 
@@ -200,35 +300,74 @@ async def handle_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    original_text = query.message.text_html
     action, user_id_str = query.data.split("_")
     user_id = int(user_id_str)
 
     if action == "approve":
-        await context.bot.send_message(chat_id=user_id, text="🎉 Your submission has been APPROVED.")
-        await query.edit_message_text(text=query.message.text_html + "\n\n✅ Approved", parse_mode="HTML")
+        response_text_to_user = "Congratulations! Your submission has been APPROVED.\n\nIf you have any questions, contact us: personet.com@proton.me"
+        new_text_for_admin = f"{original_text}\n\n------\n<b>✅ STATUS: APPROVED by {query.from_user.mention_html()}</b>"
+        await context.bot.send_message(chat_id=user_id, text=response_text_to_user)
     elif action == "decline":
-        await context.bot.send_message(chat_id=user_id, text="❌ Your submission has been DECLINED.")
-        await query.edit_message_text(text=query.message.text_html + "\n\n❌ Declined", parse_mode="HTML")
+        response_text_to_user = "We are sorry, but your submission has been DECLINED."
+        new_text_for_admin = f"{original_text}\n\n------\n<b>❌ STATUS: DECLINED by {query.from_user.mention_html()}</b>"
+        await context.bot.send_message(chat_id=user_id, text=response_text_to_user)
 
-# --- MAIN ---
+    await query.edit_message_text(text=new_text_for_admin, parse_mode="HTML", reply_markup=None)
+
+# --- ADMIN COMMANDS ---
+async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if str(update.effective_user.id) != ADMIN_CHAT_ID:
+        return
+    keyboard = [[
+        InlineKeyboardButton("YES, delete all data", callback_data="clear_db_confirm"),
+        InlineKeyboardButton("NO, cancel", callback_data="clear_db_cancel"),
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "⚠️ WARNING! Are you sure you want to delete ALL user data? This cannot be undone.",
+        reply_markup=reply_markup
+    )
+
+async def clear_db_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.data.endswith("confirm"):
+        clear_users_table()
+        await query.edit_message_text("✅ Database has been cleared.")
+    else:
+        await query.edit_message_text("Operation cancelled.")
+
+# --- MAIN FUNCTION ---
 def main() -> None:
     if not all([TOKEN, ADMIN_CHAT_ID, DATABASE_URL]):
-        logger.error("❌ Missing environment variables.")
+        print("ERROR: Missing one or more environment variables.")
         return
 
     setup_database()
+
     application = Application.builder().token(TOKEN).build()
 
-    # команды
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(setup_payment_start, pattern='^setup_payment$')],
+        states={
+            SELECTING_METHOD: [CallbackQueryHandler(select_payment_method, pattern='^payment_')],
+            TYPING_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_card_details)],
+            TYPING_USDT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_usdt_details)],
+        },
+        fallbacks=[CommandHandler('start', start)],
+    )
+
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("ping", ping))
-
-    # обработка ссылок
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("clear_db", clear_db_command))
+    application.add_handler(conv_handler)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_submission))
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(approve|decline)_"))
+    application.add_handler(CallbackQueryHandler(button_handler, pattern='^(approve|decline)_'))
+    application.add_handler(CallbackQueryHandler(clear_db_confirm, pattern='^clear_db_'))
 
-    logger.info("🤖 Bot is starting...")
+    print("Bot is starting polling...")
     application.run_polling()
 
 if __name__ == "__main__":
