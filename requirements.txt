@@ -1,5 +1,5 @@
-python-telegram-bot==20.6
+python-telegram-bot
 psycopg2-binary
 python-dotenv
-requests
+google-api-python-client
 beautifulsoup4

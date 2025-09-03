@@ -60,6 +60,7 @@ def get_youtube_stats(video_id: str) -> dict:
 
 
 def get_video_stats(url: str) -> dict:
+    """Universal function to fetch video stats from different platforms."""
     stats = {"platform": "Unknown", "views": "N/A", "likes": "N/A", "comments": "N/A", "error": None}
     headers = {
         'User-Agent': (
@@ -100,6 +101,7 @@ def get_video_stats(url: str) -> dict:
                 return stats
 
             video_id = video_id_match.group(1)
+            # Вызываем исправленную функцию для YouTube
             return get_youtube_stats(video_id)
 
         else:
@@ -372,3 +374,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
